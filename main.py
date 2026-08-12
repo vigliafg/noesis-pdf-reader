@@ -4,6 +4,7 @@
 Multiple text extraction backends switchable at runtime.
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,23 @@ try:
 except ImportError:
     DocumentConverter = None  # type: ignore
     _has_docling = False
+
+try:
+    import pdf_oxide
+    from pdf_oxide import PdfDocument as _PdfOxideDocument
+    _has_pdf_oxide = True
+except ImportError:
+    pdf_oxide = None  # type: ignore
+    _PdfOxideDocument = None  # type: ignore
+    _has_pdf_oxide = False
+
+try:
+    import pdf_inspector
+    _has_pdf_inspector = True
+except ImportError:
+    pdf_inspector = None  # type: ignore
+    _has_pdf_inspector = False
+
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
@@ -216,6 +234,7 @@ class MainWindow(QMainWindow):
     # Available extraction backends
     BACKENDS = [
         "PyMuPDF4LLM ⚡", "Docling 🧠", "Smart (tabelle)",
+        "pdf_oxide 🦀", "pdf-inspector 🔍",
         "pdfminer.six", "pypdfium2", "pdfplumber",
     ]
 
@@ -231,6 +250,8 @@ class MainWindow(QMainWindow):
         self._current_page: int = 0
         self._page_count: int = 0
         self._plumber_cache: dict = {}
+        self._pdfoxide_doc = None    # cached pdf_oxide PdfDocument
+        self._pdfinspector_cache = None  # cached pdf_inspector result
         self._render_scale: float = 3.0
         self._render_md: bool = True  # toggle Markdown rendering
 
@@ -401,6 +422,8 @@ class MainWindow(QMainWindow):
             "PyMuPDF4LLM ⚡: Markdown nativo, tabelle, ~0.8s\n"
             "Docling 🧠: AI, massima qualità, ~25s (CPU)\n"
             "Smart (tabelle): tabelle ASCII + pdfminer\n"
+            "pdf_oxide 🦀: Rust, Markdown+tabelle, MIT license, ~0.5s\n"
+            "pdf-inspector 🔍: classifica, Markdown, struttura PDF taggati\n"
             "pdfminer.six: buon flusso paragrafi (~2s)\n"
             "pypdfium2: ⚡ istantaneo, usa il doc già aperto\n"
             "pdfplumber: preciso con tabelle/colonne (~2s)"
@@ -439,6 +462,10 @@ class MainWindow(QMainWindow):
             text = self._extract_docling(page_num)
         elif backend == "Smart (tabelle)":
             text = self._extract_smart(page_num)
+        elif backend == "pdf_oxide 🦀":
+            text = self._extract_pdfoxide(page_num)
+        elif backend == "pdf-inspector 🔍":
+            text = self._extract_pdfinspector(page_num)
         elif backend == "pypdfium2":
             text = self._extract_pdfium(page_num)
         elif backend == "pdfplumber":
@@ -530,6 +557,53 @@ class MainWindow(QMainWindow):
         except Exception:
             return "(errore smart)"
 
+    def _extract_pdfoxide(self, page_num: int) -> str:
+        """pdf_oxide: Rust engine, native Markdown + tables, MIT license."""
+        if not _has_pdf_oxide:
+            return "(pdf_oxide non installato — esegui: pip install pdf_oxide)"
+        try:
+            if self._pdfoxide_doc is None:
+                # Suppress noisy stderr warnings during document open
+                _old_stderr = sys.stderr
+                sys.stderr = open(os.devnull, "w")
+                try:
+                    self._pdfoxide_doc = _PdfOxideDocument(str(self._pdf_path))
+                finally:
+                    sys.stderr.close()
+                    sys.stderr = _old_stderr
+            md = self._pdfoxide_doc.to_markdown(page_num, detect_headings=True)
+            return md.strip() or "(nessun testo estraibile su questa pagina)"
+        except Exception as e:
+            return f"(errore pdf_oxide: {e})"
+
+    def _extract_pdfinspector(self, page_num: int) -> str:
+        """pdf-inspector: classify + structured Markdown, tagged PDF support.
+
+        NOTE: extract_pages_markdown() parses the entire document on every call,
+        so per-page navigation on large PDFs (>1000 pages) is inherently slow.
+        Caching only helps revisiting the same page.
+        """
+        if not _has_pdf_inspector:
+            return "(pdf-inspector non installato — esegui: pip install pdf-inspector)"
+        try:
+            if self._pdfinspector_cache is None:
+                self._pdfinspector_cache = pdf_inspector.extract_pages_markdown(
+                    str(self._pdf_path), pages=[page_num]
+                )
+            elif page_num not in self._pdfinspector_cache.pages:
+                # Page not in cache — re-extract (re-parses entire doc, can be slow)
+                self._pdfinspector_cache = pdf_inspector.extract_pages_markdown(
+                    str(self._pdf_path), pages=[page_num]
+                )
+            page_data = self._pdfinspector_cache.pages.get(page_num)
+            if page_data is not None:
+                md = getattr(page_data, "markdown", None)
+                if md:
+                    return md.strip()
+            return "(nessun testo estraibile su questa pagina)"
+        except Exception as e:
+            return f"(errore pdf-inspector: {e})"
+
     def _extract_pdfminer(self, page_num: int) -> str:
         """Use pdfminer.six (good paragraph flow)."""
         try:
@@ -584,6 +658,8 @@ class MainWindow(QMainWindow):
     def _on_backend_changed(self, _text: str):
         """Re-extract text for current page when backend changes."""
         self._plumber_cache.clear()
+        self._pdfoxide_doc = None
+        self._pdfinspector_cache = None
         if self._pdf_doc is not None and self._page_count > 0 and self._pdf_path:
             text, elapsed = self._extract_text(self._current_page)
             backend = self.backend_combo.currentText()
@@ -645,6 +721,8 @@ class MainWindow(QMainWindow):
             self._page_count = len(self._pdf_doc)
 
             self._plumber_cache.clear()
+            self._pdfoxide_doc = None
+            self._pdfinspector_cache = None
 
             self.page_spin.setEnabled(True)
             self.page_spin.setMaximum(max(self._page_count, 1))
@@ -666,6 +744,8 @@ class MainWindow(QMainWindow):
         if self._pdf_doc is not None:
             self._pdf_doc.close()
         self._plumber_cache.clear()
+        self._pdfoxide_doc = None
+        self._pdfinspector_cache = None
         super().closeEvent(event)
 
 

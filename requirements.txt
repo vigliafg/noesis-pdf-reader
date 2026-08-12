@@ -9,6 +9,8 @@ pdfplumber>=0.10
 pdfminer.six>=20231228
 pymupdf4llm>=0.0.9
 docling>=2.0
+pdf_oxide>=0.3.77
+pdf-inspector>=1.14
 
 # Markdown rendering
 markdown>=3.5
