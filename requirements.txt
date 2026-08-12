@@ -1,0 +1,14 @@
+# Core GUI framework
+PyQt6>=6.6
+
+# PDF rendering
+pypdfium2>=4.30
+
+# Text extraction backends
+pdfplumber>=0.10
+pdfminer.six>=20231228
+pymupdf4llm>=0.0.9
+docling>=2.0
+
+# Markdown rendering
+markdown>=3.5
