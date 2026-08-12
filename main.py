@@ -4,9 +4,13 @@
 Multiple text extraction backends switchable at runtime.
 """
 
+import json
 import os
+import re
 import sys
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -39,10 +43,11 @@ except ImportError:
     _PdfOxideDocument = None  # type: ignore
     _has_pdf_oxide = False
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QHBoxLayout,
     QMainWindow,
     QSplitter,
     QScrollArea,
@@ -109,6 +114,100 @@ def _format_table_ascii(table: list[list[str | None]], max_col_width: int = 28) 
         lines.append(_sep())
 
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Google Translate (stdlib only, no API key)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_GT_URL = "https://translate.googleapis.com/translate_a/single"
+_GT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _gt_translate_one(text: str, source: str, target: str) -> str:
+    """Call Google Translate API for a single chunk of text."""
+    params = {
+        "client": "gtx",
+        "sl": source,
+        "tl": target,
+        "dt": "t",
+        "q": text,
+    }
+    full_url = f"{_GT_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(full_url, headers=_GT_HEADERS)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    if result and result[0]:
+        return "".join(item[0] for item in result[0] if item[0])
+    return text
+
+
+def translate_text_google(
+    text: str, source: str = "en", target: str = "it", chunk_size: int = 1500
+) -> str:
+    """Translate text using Google Translate's public API.
+
+    Translates **each paragraph independently** (split on ``\n\n``) so
+    paragraph breaks never pass through the API.  Very long paragraphs
+    are further split into chunks at natural boundaries.  This avoids
+    the sentinel-token fragility of earlier approaches.
+    """
+    if not text or not text.strip():
+        return text
+
+    paragraphs = text.split("\n\n")
+    translated_paras: list[str] = []
+
+    for para in paragraphs:
+        stripped = para.strip()
+        if not stripped:
+            translated_paras.append(para)
+            continue
+
+        # Short paragraph → translate as-is
+        if len(para) <= chunk_size:
+            try:
+                translated_paras.append(
+                    _gt_translate_one(para, source, target)
+                )
+            except Exception:
+                translated_paras.append(para)
+            continue
+
+        # Long paragraph → split into sub-chunks at sentence-ish boundaries
+        # (period + space, newline, or comma in a pinch)
+        sub_paras = re.split(r"(?<=[.!?])\s+", para)
+        sub_chunks: list[str] = []
+        current: list[str] = []
+        cur_len = 0
+
+        for sub in sub_paras:
+            if cur_len + len(sub) > chunk_size and current:
+                sub_chunks.append(" ".join(current))
+                current = []
+                cur_len = 0
+            current.append(sub)
+            cur_len += len(sub)
+        if current:
+            sub_chunks.append(" ".join(current))
+
+        # Translate each sub-chunk, rejoin with space
+        sub_translated: list[str] = []
+        for ch in sub_chunks:
+            try:
+                sub_translated.append(
+                    _gt_translate_one(ch, source, target)
+                )
+            except Exception:
+                sub_translated.append(ch)
+        translated_paras.append(" ".join(sub_translated))
+
+    return "\n\n".join(translated_paras)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -218,6 +317,210 @@ class TextPanel(QTextEdit):
         self.setHtml(self._HTML_CSS + html_body)
 
 
+class TranslateThread(QThread):
+    """Background thread for Google Translate to keep UI responsive."""
+
+    result_ready = pyqtSignal(int, str)  # generation_id, translated_text
+
+    def __init__(
+        self,
+        text: str,
+        generation: int,
+        source: str = "en",
+        target: str = "it",
+    ):
+        super().__init__()
+        self._text = text
+        self._generation = generation
+        self._source = source
+        self._target = target
+
+    def run(self):
+        translated = translate_text_google(
+            self._text, source=self._source, target=self._target
+        )
+        self.result_ready.emit(self._generation, translated)
+
+
+class TranslatablePanel(QWidget):
+    """Wraps TextPanel with a tab bar to switch between original and Italian."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── Tab bar ────────────────────────────────────────────────────
+        self._tab_bar = QWidget()
+        self._tab_bar.setFixedHeight(36)
+        self._tab_bar.setStyleSheet("""
+            QWidget#tabBar {
+                background: #3a3a3a;
+                border-bottom: 1px solid #555;
+            }
+        """)
+        self._tab_bar.setObjectName("tabBar")
+
+        tab_layout = QHBoxLayout(self._tab_bar)
+        tab_layout.setContentsMargins(4, 2, 4, 2)
+        tab_layout.setSpacing(2)
+
+        self._btn_original = QPushButton("📄 Originale")
+        self._btn_translated = QPushButton("🇮🇹 Italiano")
+
+        tab_style = """
+            QPushButton {
+                background: #444; color: #aaa;
+                border: 1px solid #555; border-bottom: none;
+                border-radius: 6px 6px 0 0;
+                padding: 4px 16px; font-size: 13px;
+            }
+            QPushButton:hover { background: #555; color: #ddd; }
+            QPushButton:checked {
+                background: #fff; color: #1a1a1a;
+                border-color: #ddd; font-weight: bold;
+            }
+        """
+        for btn in (self._btn_original, self._btn_translated):
+            btn.setCheckable(True)
+            btn.setFlat(True)
+            btn.setStyleSheet(tab_style)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            tab_layout.addWidget(btn)
+
+        # Spinner label for translation in progress
+        self._lbl_spinner = QLabel("")
+        self._lbl_spinner.setStyleSheet("color: #aaa; font-size: 13px; padding: 4px 8px;")
+        tab_layout.addWidget(self._lbl_spinner)
+
+        tab_layout.addStretch()
+        self._btn_original.setChecked(True)
+
+        # ── Text panel ─────────────────────────────────────────────────
+        self.text_panel = TextPanel()
+
+        layout.addWidget(self._tab_bar)
+        layout.addWidget(self.text_panel)
+
+        # ── State ──────────────────────────────────────────────────────
+        self._original_text: str = ""
+        self._translated_text: str = ""
+        self._render_md: bool = True
+        self._page_translation_cache: dict[int, str] = {}
+        self._current_page: int = -1
+        self._thread: TranslateThread | None = None
+        self._generation: int = 0  # monotonically increasing; ignore stale results
+
+        # ── Connections ────────────────────────────────────────────────
+        self._btn_original.clicked.connect(self._on_show_original)
+        self._btn_translated.clicked.connect(self._on_show_translated)
+
+    def show_text(
+        self,
+        text: str,
+        as_markdown: bool = True,
+        page_num: int = -1,
+        force_retranslate: bool = False,
+    ):
+        """Display text and prepare translation.
+
+        If ``page_num`` is provided, the translation is cached per page.
+        """
+        self._render_md = as_markdown
+        self._original_text = text
+        self._current_page = page_num
+
+        if self._btn_translated.isChecked():
+            # Translated tab is active — retranslate for the new page
+            if (
+                not force_retranslate
+                and page_num >= 0
+                and page_num in self._page_translation_cache
+            ):
+                self._translated_text = self._page_translation_cache[page_num]
+                self.text_panel.show_text(
+                    self._translated_text, as_markdown=as_markdown
+                )
+                self._lbl_spinner.setText("")
+            else:
+                self._start_translation(text)
+        else:
+            # Original tab is active (default)
+            self._btn_original.setChecked(True)
+            self._btn_translated.setChecked(False)
+            self.text_panel.show_text(text, as_markdown=as_markdown)
+            self._lbl_spinner.setText("")
+
+    def _on_show_original(self):
+        self._btn_original.setChecked(True)
+        self._btn_translated.setChecked(False)
+        self.text_panel.show_text(self._original_text, as_markdown=self._render_md)
+        self._lbl_spinner.setText("")
+
+    def _on_show_translated(self):
+        self._btn_original.setChecked(False)
+        self._btn_translated.setChecked(True)
+
+        # Check cache
+        if (
+            self._current_page >= 0
+            and self._current_page in self._page_translation_cache
+        ):
+            self._translated_text = self._page_translation_cache[self._current_page]
+            self.text_panel.show_text(
+                self._translated_text, as_markdown=self._render_md
+            )
+            self._lbl_spinner.setText("")
+        else:
+            self._start_translation(self._original_text)
+
+    def _start_translation(self, text: str):
+        """Fire background translation thread with generation tracking."""
+        self._lbl_spinner.setText("⏳ Traducendo...")
+        self._generation += 1
+
+        # Disconnect old thread to avoid stale signals
+        if self._thread is not None:
+            try:
+                self._thread.result_ready.disconnect()
+            except TypeError:
+                pass  # already disconnected
+
+        self._thread = TranslateThread(
+            text, generation=self._generation, source="en", target="it"
+        )
+        self._thread.result_ready.connect(self._on_translation_done)
+        self._thread.start()
+
+    def _on_translation_done(self, generation: int, translated: str):
+        """Slot: background translation finished."""
+        # Ignore stale results from superseded requests
+        if generation != self._generation:
+            return
+
+        self._translated_text = translated
+
+        # Cache per page
+        if self._current_page >= 0:
+            self._page_translation_cache[self._current_page] = translated
+
+        # Show if translated tab still active
+        if self._btn_translated.isChecked():
+            self.text_panel.show_text(translated, as_markdown=self._render_md)
+
+        self._lbl_spinner.setText("✅")
+
+    def show_html(self, html_body: str):
+        """Forward to inner TextPanel."""
+        self.text_panel.setHtml(self.text_panel._HTML_CSS + html_body)
+
+    def invalidate_cache(self):
+        """Clear per-page translation cache."""
+        self._page_translation_cache.clear()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  main window
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -266,8 +569,8 @@ class MainWindow(QMainWindow):
         self.pdf_view = PdfPageView()
         self.scroll_area.setWidget(self.pdf_view)
 
-        # Right — text panel
-        self.text_panel = TextPanel()
+        # Right — text panel with translation tabs
+        self.text_panel = TranslatablePanel()
 
         self.splitter.addWidget(self.scroll_area)
         self.splitter.addWidget(self.text_panel)
@@ -422,9 +725,11 @@ class MainWindow(QMainWindow):
         self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
         bar.addWidget(self.backend_combo)
 
-    def _display_text(self, text: str):
+    def _display_text(self, text: str, page_num: int = -1):
         """Display extracted text respecting the current MD toggle."""
-        self.text_panel.show_text(text, as_markdown=self._render_md)
+        self.text_panel.show_text(
+            text, as_markdown=self._render_md, page_num=page_num
+        )
 
     def _toggle_markdown(self):
         """Toggle Markdown rendering on/off and refresh display."""
@@ -438,7 +743,7 @@ class MainWindow(QMainWindow):
             text, elapsed = self._extract_text(self._current_page)
             backend = self.backend_combo.currentText()
             header = f"── Backend: {backend}  │  {elapsed*1000:.1f} ms  │  {len(text)} caratteri ──\n\n"
-            self._display_text(header + text)
+            self._display_text(header + text, page_num=self._current_page)
 
     # ── text extraction backends ──────────────────────────────────────────
 
@@ -595,7 +900,7 @@ class MainWindow(QMainWindow):
             backend = self.backend_combo.currentText()
             # Prepend backend + timing header
             header = f"── Backend: {backend}  │  {elapsed*1000:.1f} ms  │  {len(text)} caratteri ──\n\n"
-            self._display_text(header + text)
+            self._display_text(header + text, page_num=page_num)
 
         # Update toolbar
         self.page_spin.blockSignals(True)
@@ -620,11 +925,12 @@ class MainWindow(QMainWindow):
         """Re-extract text for current page when backend changes."""
         self._plumber_cache.clear()
         self._pdfoxide_doc = None
+        self.text_panel.invalidate_cache()
         if self._pdf_doc is not None and self._page_count > 0 and self._pdf_path:
             text, elapsed = self._extract_text(self._current_page)
             backend = self.backend_combo.currentText()
             header = f"── Backend: {backend}  │  {elapsed*1000:.1f} ms  │  {len(text)} caratteri ──\n\n"
-            self._display_text(header + text)
+            self._display_text(header + text, page_num=self._current_page)
             self.status_bar.showMessage(
                 f"Pagina {self._current_page + 1} di {self._page_count}"
                 f"  —  {self._pdf_path.name}"
@@ -682,6 +988,7 @@ class MainWindow(QMainWindow):
 
             self._plumber_cache.clear()
             self._pdfoxide_doc = None
+            self.text_panel.invalidate_cache()
 
             self.page_spin.setEnabled(True)
             self.page_spin.setMaximum(max(self._page_count, 1))
