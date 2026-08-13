@@ -43,7 +43,21 @@ except ImportError:
     _PdfOxideDocument = None  # type: ignore
     _has_pdf_oxide = False
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+try:
+    import pymupdf
+    _has_pymupdf = True
+except ImportError:
+    pymupdf = None  # type: ignore
+    _has_pymupdf = False
+
+try:
+    from PyQt6.QtPdf import QPdfDocument
+    _has_qtpdf = True
+except ImportError:
+    QPdfDocument = None  # type: ignore
+    _has_qtpdf = False
+
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize
 from PyQt6.QtGui import QImage, QPixmap, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -62,6 +76,9 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QWidget,
     QVBoxLayout,
+    QDockWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,6 +131,273 @@ def _format_table_ascii(table: list[list[str | None]], max_col_width: int = 28) 
         lines.append(_sep())
 
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  layout fixes (generic corrections for two-column / chapter-open pages)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _collect_blocks(page) -> list[dict]:
+    """Extract text blocks (with per-span formatting) from a pymupdf page."""
+    blocks: list[dict] = []
+    for blk in page.get_text("dict")["blocks"]:
+        if blk.get("type") != 0:
+            continue
+        lines: list[list[dict]] = []
+        max_size = 0.0
+        for line in blk["lines"]:
+            spans: list[dict] = []
+            for s in line["spans"]:
+                t = s["text"]
+                if not t.strip():
+                    continue
+                spans.append(
+                    {
+                        "text": t,
+                        "size": s["size"],
+                        "bold": bool(s["flags"] & 16),
+                        "italic": bool(s["flags"] & 2),
+                    }
+                )
+                max_size = max(max_size, s["size"])
+            if spans:
+                lines.append(spans)
+        if not lines:
+            continue
+        x0, y0, x1, y1 = blk["bbox"]
+        blocks.append(
+            {
+                "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                "max_size": max_size, "lines": lines,
+            }
+        )
+    return blocks
+
+
+def _detect_column_split(blocks: list[dict], page_width: float):
+    """Return the x boundary between two text columns, or None if single-column."""
+    col = [b for b in blocks if (b["x1"] - b["x0"]) < 0.6 * page_width]
+    if len(col) < 4:
+        return None
+    intervals = sorted((b["x0"], b["x1"]) for b in col)
+    merged = [list(intervals[0])]
+    for x0, x1 in intervals[1:]:
+        if x0 <= merged[-1][1] + 3:
+            merged[-1][1] = max(merged[-1][1], x1)
+        else:
+            merged.append([x0, x1])
+    if len(merged) < 2:
+        return None
+    best_gap = 0.0
+    split = page_width / 2
+    for i in range(len(merged) - 1):
+        gap = merged[i + 1][0] - merged[i][1]
+        if gap > best_gap:
+            best_gap = gap
+            split = (merged[i][1] + merged[i + 1][0]) / 2
+    return split if best_gap >= 8 else None
+
+
+def _block_to_md(block: dict, as_column: bool) -> str:
+    """Render a block to markdown, marking headings when it's a column block."""
+    lines: list[str] = []
+    for line in block["lines"]:
+        parts: list[str] = []
+        for s in line:
+            t = s["text"]
+            if s["bold"] and s["italic"]:
+                parts.append(f"***{t}***")
+            elif s["bold"]:
+                parts.append(f"**{t}**")
+            elif s["italic"]:
+                parts.append(f"*{t}*")
+            else:
+                parts.append(t)
+        lines.append("".join(parts).strip())
+
+    if not as_column:
+        return " ".join(lines)
+
+    size = block["max_size"]
+    level = 0
+    if size >= 14:
+        level = 1
+    elif size >= 12:
+        level = 2
+    elif size >= 9.8 and any(s["bold"] for l in block["lines"] for s in l):
+        level = 3
+
+    if level == 0:
+        return " ".join(lines)
+    if level == 1:
+        return "# " + " ".join(lines)
+
+    heading = lines[0]
+    body = " ".join(lines[1:])
+    if body:
+        return f"{'#' * level} {heading}\n\n{body}"
+    return f"{'#' * level} {heading}"
+
+
+def _table_to_md(page, table) -> str:
+    """Render a pymupdf table as a markdown table using clean per-cell text."""
+    cells = sorted(table.cells, key=lambda c: (c[1], c[0]))  # by y0 then x0
+    if not cells:
+        return ""
+
+    def _cell_text(cell) -> str:
+        x0, y0, x1, y1 = cell
+        clip = (x0 + 1.5, y0 + 1.5, max(x0 + 1.5, x1 - 1.5), max(y0 + 1.5, y1 - 1.5))
+        return " ".join(page.get_textbox(clip).split()).strip()
+
+    # Group cells into rows by their top y-coordinate.
+    rows: list[tuple[float, list[tuple[float, str]]]] = []
+    for cell in cells:
+        txt = _cell_text(cell)
+        if not txt:
+            continue
+        y0 = cell[1]
+        if rows and abs(rows[-1][0] - y0) < 5.0:
+            rows[-1][1].append((cell[0], txt))
+        else:
+            rows.append((y0, [(cell[0], txt)]))
+    for _, row in rows:
+        row.sort(key=lambda c: c[0])
+
+    if not rows:
+        return ""
+
+    out: list[str] = []
+    # A leading single-cell row is treated as the table caption.
+    if len(rows[0][1]) == 1:
+        caption = rows[0][1][0][1].replace("\n", " ")
+        out.append(f"**{caption}**")
+        out.append("")  # blank line so the markdown renderer sees the table
+        rows = rows[1:]
+
+    if not rows:
+        return "\n".join(out)
+
+    header = [txt.replace("\n", " ") for _, txt in rows[0][1]]
+    ncols = len(header)
+    out.append("| " + " | ".join(header) + " |")
+    out.append("| " + " | ".join("---" for _ in header) + " |")
+    for _, row in rows[1:]:
+        cell_md = [txt.replace("\n", "<br>") for _, txt in row]
+        cell_md = (cell_md + [""] * ncols)[:ncols]
+        out.append("| " + " | ".join(cell_md) + " |")
+    return "\n".join(out)
+
+
+def _column_aware_markdown(page, move_title: bool = False) -> str:
+    """Reconstruct a page in correct reading order (full-width → columns).
+
+    Full-width blocks and data tables act as separators; the two text
+    columns are emitted band-by-band (left column then right) between them,
+    so tables in the middle of a page are no longer dropped.
+    """
+    page_width = page.rect.width
+
+    # Detect data tables (rendered as markdown) and exclude them from columns.
+    tables: list[tuple[float, str]] = []  # (y0, markdown)
+    table_regions: list[tuple] = []
+    try:
+        tabs = page.find_tables()
+    except Exception:
+        tabs = None
+    if tabs:
+        for t in tabs.tables:
+            if t.row_count <= 1 and t.col_count <= 2:
+                continue  # likely a chapter-title block, not a data table
+            table_regions.append(tuple(t.bbox))
+            md = _table_to_md(page, t)
+            if md:
+                tables.append((t.bbox[1], md))
+
+    def _inside(b: dict, r: tuple) -> bool:
+        return (
+            b["x0"] >= r[0] - 2 and b["x1"] <= r[2] + 2
+            and b["y0"] >= r[1] - 2 and b["y1"] <= r[3] + 2
+        )
+
+    blocks = [b for b in _collect_blocks(page) if b["max_size"] >= 8.0]
+
+    full_width: list[dict] = []
+    columns: list[dict] = []
+    for b in blocks:
+        if any(_inside(b, r) for r in table_regions):
+            continue  # covered by the markdown table
+        if (b["x1"] - b["x0"]) >= 0.6 * page_width:
+            full_width.append(b)
+        elif (b["x1"] - b["x0"]) >= 25:
+            columns.append(b)
+
+    # Separators: markdown tables + full-width blocks, sorted by y.
+    separators: list[tuple[float, str]] = list(tables)
+    for b in full_width:
+        md = _block_to_md(b, as_column=False)
+        if md:
+            separators.append((b["y0"], md))
+    separators.sort(key=lambda s: s[0])
+
+    # Single-column fallback → treat everything as one column.
+    split = _detect_column_split(columns, page_width)
+    if split is None:
+        split = page_width + 1
+
+    # Move chapter title(s) out of the column flow when requested.
+    titles: list[dict] = []
+    if move_title:
+        titles = [b for b in columns if b["max_size"] >= 14 and b["x0"] < split]
+        columns = [b for b in columns if b not in titles]
+        titles.sort(key=lambda b: b["max_size"])
+
+    out: list[str] = []
+    for t in titles:
+        out.append(_block_to_md(t, as_column=True))
+
+    sep_marks = [y0 for y0, _ in separators]
+
+    def _band(b: dict) -> int:
+        return sum(1 for sy in sep_marks if b["y0"] >= sy)
+
+    def _emit(blks: list[dict], as_column: bool):
+        for b in blks:
+            md = _block_to_md(b, as_column=as_column)
+            if md:
+                out.append(md)
+
+    n_seps = len(separators)
+    for band_idx in range(n_seps + 1):
+        band_cols = [b for b in columns if _band(b) == band_idx]
+        _emit(
+            sorted(
+                [b for b in band_cols if b["x0"] < split],
+                key=lambda b: (b["y0"], b["x0"]),
+            ),
+            as_column=True,
+        )
+        _emit(
+            sorted(
+                [b for b in band_cols if b["x0"] >= split],
+                key=lambda b: (b["y0"], b["x0"]),
+            ),
+            as_column=True,
+        )
+        if band_idx < n_seps:
+            out.append(separators[band_idx][1])
+
+    return "\n\n".join(out)
+
+
+def _spacing_fixes(md: str) -> str:
+    """Generic cosmetic spacing fixes for markdown artifacts."""
+    # bold chapter cross-reference glued to the following word: **134**and
+    md = re.sub(r"\*\*(\d+)\*\*(?=\S)", r"**\1** ", md)
+    # underscore-italic word followed by a comma glued to the next word: _a_,_b_
+    md = re.sub(r"(_[^_]+_),", r"\1, ", md)
+    return md
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -240,6 +524,12 @@ class PdfPageView(QLabel):
         self._full_pixmap = pixmap
         self._last_size = None
         self._fit_to_view()
+
+    def show_message(self, text: str):
+        """Show a plain status message instead of a page (e.g. while loading)."""
+        self._full_pixmap = None
+        self._last_size = None
+        self.setText(text)
 
     def _fit_to_view(self):
         """Scale the full-resolution pixmap to fit the current label size."""
@@ -521,6 +811,97 @@ class TranslatablePanel(QWidget):
         self._page_translation_cache.clear()
 
 
+class TocPanel(QWidget):
+    """Dockable multi-level table of contents navigator."""
+
+    page_selected = pyqtSignal(int)  # 0-based page index
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(16)
+        self.tree.setStyleSheet(
+            "QTreeWidget { background: #2b2b2b; color: #ddd; border: none;"
+            " font-size: 13px; }"
+            "QTreeWidget::item { padding: 2px 0; }"
+            "QTreeWidget::item:selected { background: #3a6bc5; color: #fff; }"
+        )
+        layout.addWidget(self.tree)
+
+        self._items: list[QTreeWidgetItem] = []  # flat, in document order
+        self._syncing: bool = False
+
+        self.tree.itemClicked.connect(self._on_item_clicked)
+
+    def build_toc(self, doc) -> None:
+        """Rebuild the tree from a pypdfium2 PdfDocument's bookmarks."""
+        self.tree.clear()
+        self._items = []
+
+        stack: list[tuple[int, QTreeWidgetItem]] = []  # (level, item)
+        try:
+            bookmarks = list(doc.get_toc())
+        except Exception:
+            bookmarks = []
+
+        for bm in bookmarks:
+            dest = bm.get_dest()
+            if dest is None:
+                continue
+            page_idx = dest.get_index()
+            if page_idx is None:
+                continue
+
+            title = (bm.get_title() or "").strip() or "(senza titolo)"
+            item = QTreeWidgetItem([f"{title}  ·  p. {page_idx + 1}"])
+            item.setData(0, Qt.ItemDataRole.UserRole, page_idx)
+
+            level = max(0, int(bm.level))
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            if stack:
+                stack[-1][1].addChild(item)
+            else:
+                self.tree.addTopLevelItem(item)
+            stack.append((level, item))
+            self._items.append(item)
+
+        self.tree.expandAll()
+
+    def select_page(self, page_num: int) -> None:
+        """Highlight the TOC entry that best matches the given 0-based page."""
+        best: QTreeWidgetItem | None = None
+        for item in self._items:
+            p = item.data(0, Qt.ItemDataRole.UserRole)
+            if p is None:
+                continue
+            if p <= page_num:
+                best = item
+            else:
+                break
+
+        if best is None:
+            return
+        self._syncing = True
+        self.tree.setCurrentItem(best)
+        self.tree.scrollToItem(best)
+        self._syncing = False
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, _column: int):
+        if self._syncing:
+            return
+        page_idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if page_idx is None:
+            return
+        self.page_selected.emit(int(page_idx))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  main window
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -532,6 +913,17 @@ class MainWindow(QMainWindow):
         "PyMuPDF4LLM ⚡", "Docling 🧠", "Smart (tabelle)",
         "pdf_oxide 🦀",
         "pdfminer.six", "pypdfium2", "pdfplumber",
+    ]
+
+    # Available rendering engines
+    RENDER_ENGINES = ["pypdfium2", "PyMuPDF", "QtPdf"]
+
+    # Available layout fixes
+    FIXES = [
+        "Nessuno",
+        "Riordino colonne",
+        "Colonne + titolo in testa",
+        "Spaziature",
     ]
 
     def __init__(self):
@@ -547,6 +939,8 @@ class MainWindow(QMainWindow):
         self._page_count: int = 0
         self._plumber_cache: dict = {}
         self._pdfoxide_doc = None    # cached pdf_oxide PdfDocument
+        self._mupdf_doc = None       # cached pymupdf Document (render engine)
+        self._qtpdf_doc = None       # cached QPdfDocument (render engine)
         self._render_scale: float = 3.0
         self._render_md: bool = True  # toggle Markdown rendering
 
@@ -559,6 +953,20 @@ class MainWindow(QMainWindow):
 
         # Toolbar
         self._build_toolbar(root_layout)
+
+        # TOC dock (left, dockable)
+        self.toc_panel = TocPanel()
+        self.toc_panel.page_selected.connect(self._goto_toc_page)
+        self.toc_dock = QDockWidget("Indice", self)
+        self.toc_dock.setObjectName("tocDock")
+        self.toc_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.toc_dock.setWidget(self.toc_panel)
+        self.toc_dock.setMinimumWidth(220)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.toc_dock)
+        self.toc_dock.visibilityChanged.connect(self.btn_toc.setChecked)
 
         # Splitter
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -653,6 +1061,16 @@ class MainWindow(QMainWindow):
         btn_open.clicked.connect(self._on_open)
         bar.addWidget(btn_open)
 
+        # TOC toggle
+        self.btn_toc = QPushButton("📑 Indice")
+        self.btn_toc.setCheckable(True)
+        self.btn_toc.setChecked(True)
+        self.btn_toc.setToolTip("Mostra/nascondi l'indice (TOC) del PDF")
+        self.btn_toc.clicked.connect(
+            lambda checked: self.toc_dock.setVisible(checked)
+        )
+        bar.addWidget(self.btn_toc)
+
         bar.addSeparator()
 
         # Prev
@@ -708,6 +1126,19 @@ class MainWindow(QMainWindow):
         self.btn_md_toggle.clicked.connect(self._toggle_markdown)
         bar.addWidget(self.btn_md_toggle)
 
+        # Rendering engine selector
+        bar.addWidget(QLabel("Render:"))
+        self.render_combo = QComboBox()
+        self.render_combo.addItems(self.RENDER_ENGINES)
+        self.render_combo.setToolTip(
+            "Motore di rendering della pagina (visualizzazione)\n"
+            "pypdfium2: PDFium (predefinito)\n"
+            "PyMuPDF: MuPDF, veloce\n"
+            "QtPdf: nativo Qt (Chromium PDFium)"
+        )
+        self.render_combo.currentTextChanged.connect(self._on_render_engine_changed)
+        bar.addWidget(self.render_combo)
+
         # Text extraction backend selector
         bar.addWidget(QLabel("Testo:"))
         self.backend_combo = QComboBox()
@@ -725,6 +1156,20 @@ class MainWindow(QMainWindow):
         self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
         bar.addWidget(self.backend_combo)
 
+        # Layout fix selector
+        bar.addWidget(QLabel("Fix:"))
+        self.fix_combo = QComboBox()
+        self.fix_combo.addItems(self.FIXES)
+        self.fix_combo.setToolTip(
+            "Correzioni generiche al layout estratto\n"
+            "Nessuno: output del backend così com'è\n"
+            "Riordino colonne: riordina le pagine a due colonne\n"
+            "Colonne + titolo in testa: sposta il titolo del capitolo in cima\n"
+            "Spaziature: correzioni cosmetiche al markdown"
+        )
+        self.fix_combo.currentTextChanged.connect(self._on_fix_changed)
+        bar.addWidget(self.fix_combo)
+
     def _display_text(self, text: str, page_num: int = -1):
         """Display extracted text respecting the current MD toggle."""
         self.text_panel.show_text(
@@ -741,9 +1186,10 @@ class MainWindow(QMainWindow):
         # Re-render current text
         if self._pdf_doc is not None and self._page_count > 0 and self._pdf_path:
             text, elapsed = self._extract_text(self._current_page)
-            backend = self.backend_combo.currentText()
-            header = f"── Backend: {backend}  │  {elapsed*1000:.1f} ms  │  {len(text)} caratteri ──\n\n"
-            self._display_text(header + text, page_num=self._current_page)
+            self._display_text(
+                self._extraction_header(text, elapsed) + text,
+                page_num=self._current_page,
+            )
 
     # ── text extraction backends ──────────────────────────────────────────
 
@@ -768,6 +1214,9 @@ class MainWindow(QMainWindow):
             text = self._extract_pdfminer(page_num)
         else:
             text = "(backend sconosciuto)"
+
+        # Apply the selected layout fix
+        text = self._apply_fix(text, page_num)
 
         elapsed = time.perf_counter() - t0
         return text, elapsed
@@ -890,17 +1339,15 @@ class MainWindow(QMainWindow):
         self._current_page = page_num
 
         # Render left
-        page = self._pdf_doc[page_num]
-        pix = pdfium_page_to_pixmap(page, scale=self._render_scale)
-        self.pdf_view.show_page(pix)
+        self._display_page(page_num)
 
         # Extract text right
         if self._pdf_path:
             text, elapsed = self._extract_text(page_num)
             backend = self.backend_combo.currentText()
-            # Prepend backend + timing header
-            header = f"── Backend: {backend}  │  {elapsed*1000:.1f} ms  │  {len(text)} caratteri ──\n\n"
-            self._display_text(header + text, page_num=page_num)
+            self._display_text(
+                self._extraction_header(text, elapsed) + text, page_num=page_num
+            )
 
         # Update toolbar
         self.page_spin.blockSignals(True)
@@ -912,6 +1359,9 @@ class MainWindow(QMainWindow):
             f"  |  Testo: {backend} ({elapsed*1000:.0f} ms)"
         )
 
+        # Sync TOC highlight
+        self.toc_panel.select_page(page_num)
+
     def _next_page(self):
         self._set_page(self._current_page + 1)
 
@@ -921,27 +1371,68 @@ class MainWindow(QMainWindow):
     def _on_spin(self, val: int):
         self._set_page(val - 1)
 
+    def _goto_toc_page(self, page_idx: int):
+        """Navigate to a page selected from the TOC."""
+        self._set_page(page_idx)
+
     def _on_backend_changed(self, _text: str):
         """Re-extract text for current page when backend changes."""
         self._plumber_cache.clear()
         self._pdfoxide_doc = None
         self.text_panel.invalidate_cache()
-        if self._pdf_doc is not None and self._page_count > 0 and self._pdf_path:
-            text, elapsed = self._extract_text(self._current_page)
-            backend = self.backend_combo.currentText()
-            header = f"── Backend: {backend}  │  {elapsed*1000:.1f} ms  │  {len(text)} caratteri ──\n\n"
-            self._display_text(header + text, page_num=self._current_page)
-            self.status_bar.showMessage(
-                f"Pagina {self._current_page + 1} di {self._page_count}"
-                f"  —  {self._pdf_path.name}"
-                f"  |  Testo: {backend} ({elapsed*1000:.0f} ms)"
-            )
+        self._reextract_current()
 
     def _cycle_backend(self):
         """Cycle through backends via Ctrl+B."""
         idx = self.backend_combo.currentIndex()
         nxt = (idx + 1) % len(self.BACKENDS)
         self.backend_combo.setCurrentIndex(nxt)
+
+    def _on_fix_changed(self, _text: str):
+        """Re-extract current page when the layout fix changes."""
+        self.text_panel.invalidate_cache()
+        self._reextract_current()
+
+    def _reextract_current(self):
+        """Re-extract + display text for the current page."""
+        if self._pdf_doc is None or self._page_count == 0 or not self._pdf_path:
+            return
+        text, elapsed = self._extract_text(self._current_page)
+        self._display_text(
+            self._extraction_header(text, elapsed) + text,
+            page_num=self._current_page,
+        )
+        self.status_bar.showMessage(
+            f"Pagina {self._current_page + 1} di {self._page_count}"
+            f"  —  {self._pdf_path.name}"
+            f"  |  Testo: {self.backend_combo.currentText()} ({elapsed*1000:.0f} ms)"
+        )
+
+    def _extraction_header(self, text: str, elapsed: float) -> str:
+        """Build the header line shown above the extracted text."""
+        fix = self.fix_combo.currentText()
+        fix_part = f"  │  Fix: {fix}" if fix != "Nessuno" else ""
+        return (
+            f"── Backend: {self.backend_combo.currentText()}"
+            f"  │  {elapsed*1000:.1f} ms"
+            f"  │  {len(text)} caratteri{fix_part} ──\n\n"
+        )
+
+    def _apply_fix(self, text: str, page_num: int) -> str:
+        """Apply the selected layout fix to extracted text."""
+        fix = self.fix_combo.currentText()
+        if fix == "Nessuno":
+            return text
+        if fix == "Spaziature":
+            return _spacing_fixes(text)
+        doc = self._get_mupdf_doc()
+        if doc is None:
+            return text
+        move_title = fix == "Colonne + titolo in testa"
+        try:
+            return _column_aware_markdown(doc[page_num], move_title=move_title) or text
+        except Exception:
+            return text
 
     # ── zoom ───────────────────────────────────────────────────────────────
 
@@ -960,9 +1451,111 @@ class MainWindow(QMainWindow):
     def _update_zoom(self):
         self.zoom_label.setText(f"Scala: {self._render_scale:.2f}x")
         if self._pdf_doc is not None and self._page_count > 0:
-            page = self._pdf_doc[self._current_page]
-            pix = pdfium_page_to_pixmap(page, scale=self._render_scale)
+            self._display_page(self._current_page)
+
+    # ── rendering engine ──────────────────────────────────────────────────
+
+    def _get_mupdf_doc(self):
+        """Open (lazily) the pymupdf document for rendering."""
+        if self._mupdf_doc is None and self._pdf_path and _has_pymupdf:
+            try:
+                self._mupdf_doc = pymupdf.open(str(self._pdf_path))
+            except Exception:
+                self._mupdf_doc = None
+        return self._mupdf_doc
+
+    def _get_qtpdf_doc(self):
+        """Open (lazily) the QPdfDocument for rendering."""
+        if self._qtpdf_doc is None and self._pdf_path and _has_qtpdf:
+            doc = QPdfDocument(self)
+            doc.statusChanged.connect(self._on_qtpdf_status)
+            self._qtpdf_doc = doc
+            doc.load(str(self._pdf_path))
+        return self._qtpdf_doc
+
+    def _render_pymupdf(self, page_num: int) -> QPixmap | None:
+        doc = self._get_mupdf_doc()
+        if doc is None:
+            return None
+        try:
+            page = doc[page_num]
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(self._render_scale, self._render_scale)
+            )
+            img = QImage(
+                pix.samples, pix.width, pix.height, pix.stride,
+                QImage.Format.Format_RGB888,
+            )
+            return QPixmap.fromImage(img)
+        except Exception:
+            return None
+
+    def _render_qtpdf(self, page_num: int) -> QPixmap | None:
+        doc = self._get_qtpdf_doc()
+        if doc is None or doc.status() != QPdfDocument.Status.Ready:
+            return None
+        try:
+            pt = doc.pagePointSize(page_num)
+            w = max(1, int(pt.width() * self._render_scale))
+            h = max(1, int(pt.height() * self._render_scale))
+            img = doc.render(page_num, QSize(w, h))
+            if img.isNull():
+                return None
+            return QPixmap.fromImage(img)
+        except Exception:
+            return None
+
+    def _render_page(self, page_num: int) -> QPixmap | None:
+        """Render a page with the currently selected engine."""
+        engine = self.render_combo.currentText()
+        if engine == "PyMuPDF":
+            return self._render_pymupdf(page_num)
+        if engine == "QtPdf":
+            return self._render_qtpdf(page_num)
+        # pypdfium2 (default — canonical doc is already open)
+        return pdfium_page_to_pixmap(
+            self._pdf_doc[page_num], scale=self._render_scale
+        )
+
+    def _display_page(self, page_num: int):
+        """Render + show a page, with informative fallback messages."""
+        engine = self.render_combo.currentText()
+        pix = self._render_page(page_num)
+        if pix is not None:
             self.pdf_view.show_page(pix)
+            return
+        if engine == "PyMuPDF" and not _has_pymupdf:
+            self.pdf_view.show_message("(pymupdf non installato)")
+        elif engine == "QtPdf":
+            if not _has_qtpdf:
+                self.pdf_view.show_message("(QtPdf non disponibile)")
+            elif (
+                self._qtpdf_doc is not None
+                and self._qtpdf_doc.status() == QPdfDocument.Status.Loading
+            ):
+                self.pdf_view.show_message("(caricamento PDF in corso…)")
+            else:
+                self.pdf_view.show_message("(pagina non disponibile con QtPdf)")
+        else:
+            self.pdf_view.show_message("(pagina non disponibile)")
+
+    def _on_qtpdf_status(self, status):
+        """Re-render when QtPdf finishes loading (or report an error)."""
+        if self.sender() is not self._qtpdf_doc:
+            return  # stale document
+        if self.render_combo.currentText() != "QtPdf":
+            return
+        if self._pdf_doc is None or self._page_count == 0:
+            return
+        if status == QPdfDocument.Status.Ready:
+            self._display_page(self._current_page)
+        elif status == QPdfDocument.Status.Error:
+            self.pdf_view.show_message("(errore caricamento PDF con QtPdf)")
+
+    def _on_render_engine_changed(self, _text: str):
+        """Re-render the current page when the engine changes."""
+        if self._pdf_doc is not None and self._page_count > 0:
+            self._display_page(self._current_page)
 
     # ── file open ─────────────────────────────────────────────────────────
 
@@ -981,6 +1574,15 @@ class MainWindow(QMainWindow):
         if self._pdf_doc is not None:
             self._pdf_doc.close()
 
+        # Reset auxiliary render documents
+        if self._mupdf_doc is not None:
+            self._mupdf_doc.close()
+            self._mupdf_doc = None
+        if self._qtpdf_doc is not None:
+            self._qtpdf_doc.close()
+            self._qtpdf_doc.deleteLater()
+            self._qtpdf_doc = None
+
         try:
             self._pdf_doc = pdfium.PdfDocument(str(path))
             self._pdf_path = path
@@ -993,6 +1595,9 @@ class MainWindow(QMainWindow):
             self.page_spin.setEnabled(True)
             self.page_spin.setMaximum(max(self._page_count, 1))
             self.lbl_total.setText(str(self._page_count))
+
+            # Build the multi-level table of contents
+            self.toc_panel.build_toc(self._pdf_doc)
 
             if self._page_count > 0:
                 self._set_page(0)
@@ -1009,6 +1614,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._pdf_doc is not None:
             self._pdf_doc.close()
+        if self._mupdf_doc is not None:
+            self._mupdf_doc.close()
+            self._mupdf_doc = None
+        if self._qtpdf_doc is not None:
+            self._qtpdf_doc.close()
+            self._qtpdf_doc = None
         self._plumber_cache.clear()
         self._pdfoxide_doc = None
         super().closeEvent(event)

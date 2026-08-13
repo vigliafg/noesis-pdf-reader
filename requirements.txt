@@ -3,6 +3,7 @@ PyQt6>=6.6
 
 # PDF rendering
 pypdfium2>=4.30
+pymupdf>=1.24
 
 # Text extraction backends
 pdfplumber>=0.10
