@@ -30,6 +30,7 @@ from main import (  # noqa: E402
     _collect_blocks,
     _column_aware_markdown,
     _detect_column_split,
+    _page_needs_column_reorder,
     _spacing_fixes,
     _table_to_md,
 )
@@ -164,6 +165,33 @@ class DetectColumnSplitTests(unittest.TestCase):
     def test_single_column_returns_none(self):
         blocks = [self._block(50, 200), self._block(55, 190)]
         self.assertIsNone(_detect_column_split(blocks, PAGE_W))
+
+
+class PageNeedsColumnReorderTests(unittest.TestCase):
+    def test_two_column_side_by_side(self):
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "Left one.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 220, 250, 300), "Left two.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 120, 520, 200), "Right one.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 220, 520, 300), "Right two.", fontsize=10)
+        self.assertTrue(_page_needs_column_reorder(page))
+        doc.close()
+
+    def test_single_column(self):
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "Only left.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 220, 250, 300), "More left.", fontsize=10)
+        self.assertFalse(_page_needs_column_reorder(page))
+        doc.close()
+
+    def test_columns_without_vertical_overlap(self):
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "L1", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 220, 250, 300), "L2", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 500, 520, 580), "R1", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 600, 520, 680), "R2", fontsize=10)
+        self.assertFalse(_page_needs_column_reorder(page))
+        doc.close()
 
 
 class BlockToMdTests(unittest.TestCase):

@@ -406,6 +406,59 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
     return "\n\n".join(out)
 
 
+def _page_needs_column_reorder(page) -> bool:
+    """Heuristic: does this page need the two-column reorder fix?
+
+    True only when a clear column split exists, both columns are populated
+    (≥2 blocks each) and they run side by side (their blocks overlap
+    vertically) — the exact condition where a line-by-line extraction
+    interleaves the two columns.
+    """
+    # Data tables are rendered separately; exclude their cells from the split
+    # detection (same rule as _column_aware_markdown).
+    table_regions: list[tuple] = []
+    try:
+        tabs = page.find_tables()
+    except Exception:
+        tabs = None
+    if tabs:
+        for t in tabs.tables:
+            if t.row_count <= 1 and t.col_count <= 2:
+                continue  # likely a chapter-title block, not a data table
+            table_regions.append(tuple(t.bbox))
+
+    def _inside(b: dict, r: tuple) -> bool:
+        return (
+            b["x0"] >= r[0] - 2 and b["x1"] <= r[2] + 2
+            and b["y0"] >= r[1] - 2 and b["y1"] <= r[3] + 2
+        )
+
+    blocks = [
+        b for b in _collect_blocks(page)
+        if b["max_size"] >= 8.0 and not any(_inside(b, r) for r in table_regions)
+    ]
+    page_width = page.rect.width
+    # Same column filter as _column_aware_markdown: narrow, but not stray marks.
+    columns = [
+        b for b in blocks
+        if (b["x1"] - b["x0"]) < 0.6 * page_width and (b["x1"] - b["x0"]) >= 25
+    ]
+    split = _detect_column_split(columns, page_width)
+    if split is None:
+        return False
+
+    left = [b for b in columns if b["x1"] <= split]
+    right = [b for b in columns if b["x0"] >= split]
+    if len(left) < 2 or len(right) < 2:
+        return False
+
+    return any(
+        lb["y0"] <= rb["y1"] and rb["y0"] <= lb["y1"]
+        for lb in left
+        for rb in right
+    )
+
+
 def _spacing_fixes(md: str) -> str:
     """Generic cosmetic spacing fixes for markdown artifacts."""
     # bold chapter cross-reference glued to the following word: **134**and
@@ -1213,6 +1266,7 @@ class MainWindow(QMainWindow):
 
     # Available layout fixes
     FIXES = [
+        "Auto",
         "Nessuno",
         "Riordino colonne",
         "Colonne + titolo in testa",
@@ -1467,6 +1521,7 @@ class MainWindow(QMainWindow):
         self.fix_combo.addItems(self.FIXES)
         self.fix_combo.setToolTip(
             "Correzioni generiche al layout estratto\n"
+            "Auto: applica il riordino colonne solo se la pagina lo richiede\n"
             "Nessuno: output del backend così com'è\n"
             "Riordino colonne: riordina le pagine a due colonne\n"
             "Colonne + titolo in testa: sposta il titolo del capitolo in cima\n"
@@ -1848,6 +1903,17 @@ class MainWindow(QMainWindow):
         doc = self._get_mupdf_doc()
         if doc is None:
             return text
+        if fix == "Auto":
+            # Adaptive: reorder only if the page really needs it and the
+            # backend doesn't already produce correct reading order.
+            if self.backend_combo.currentText() == "Docling 🧠":
+                return text
+            try:
+                if not _page_needs_column_reorder(doc[page_num]):
+                    return text
+                return _column_aware_markdown(doc[page_num]) or text
+            except Exception:
+                return text
         move_title = fix == "Colonne + titolo in testa"
         try:
             return _column_aware_markdown(doc[page_num], move_title=move_title) or text
