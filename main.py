@@ -66,7 +66,7 @@ except ImportError:
     QPdfDocument = None  # type: ignore
     _has_qtpdf = False
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize, QUrl
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize, QUrl, QStandardPaths
 from PyQt6.QtGui import QImage, QPixmap, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -1622,14 +1622,12 @@ class MainWindow(QMainWindow):
     def _save_docling_images(self, result, page_num: int) -> list[str]:
         """Extract Docling PictureItems for a page into a temp dir (file:// URIs)."""
         if self._docling_images_dir is None:
-            self._docling_images_dir = (
-                Path.home()
-                / ".local"
-                / "share"
-                / "noesis-pdf-reader"
-                / "images"
-                / self._pdf_path.stem
+            base = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.AppDataLocation
             )
+            if not base:
+                base = str(Path.home() / ".noesis-pdf-reader")
+            self._docling_images_dir = Path(base) / "images" / self._pdf_path.stem
         self._docling_images_dir.mkdir(parents=True, exist_ok=True)
         prefix = f"page_{page_num + 1:04d}_img_"
         for old in self._docling_images_dir.glob(prefix + "*.png"):
@@ -2131,7 +2129,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Noesis PDF Reader")
+    app.setApplicationName("noesis-pdf-reader")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
