@@ -7,6 +7,7 @@ Multiple text extraction backends switchable at runtime.
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import urllib.parse
@@ -28,10 +29,17 @@ except ImportError:
     _has_pymupdf4llm = False
 
 try:
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling_core.types.doc import PictureItem
     _has_docling = True
 except ImportError:
     DocumentConverter = None  # type: ignore
+    PdfFormatOption = None  # type: ignore
+    InputFormat = None  # type: ignore
+    PdfPipelineOptions = None  # type: ignore
+    PictureItem = None  # type: ignore
     _has_docling = False
 
 try:
@@ -57,7 +65,7 @@ except ImportError:
     QPdfDocument = None  # type: ignore
     _has_qtpdf = False
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize, QUrl
 from PyQt6.QtGui import QImage, QPixmap, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -72,6 +80,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QPushButton,
     QComboBox,
+    QDialog,
     QMessageBox,
     QStatusBar,
     QWidget,
@@ -93,6 +102,11 @@ def pdfium_page_to_pixmap(page: pdfium.PdfPage, scale: float = 3.0) -> QPixmap:
     h, w, _ = arr.shape
     img = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(img)
+
+
+def clean_text(text: str) -> str:
+    """Remove end-of-line hyphenation: "com-\npany" -> "company"."""
+    return re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
 
 
 def _format_table_ascii(table: list[list[str | None]], max_col_width: int = 28) -> str:
@@ -431,45 +445,81 @@ def _gt_translate_one(text: str, source: str, target: str) -> str:
     return text
 
 
-def translate_text_google(
-    text: str, source: str = "en", target: str = "it", chunk_size: int = 1500
-) -> str:
-    """Translate text using Google Translate's public API.
+# Markdown structural patterns protected during translation.
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_TABLE_RE = re.compile(
+    r"^\s*\|[^\n]*\|\s*\n\s*\|[\s:|-]+\|\s*\n(?:\s*\|[^\n]*\|\s*\n?)+",
+    re.MULTILINE,
+)
+_SEP_CELL_RE = re.compile(r":?-{3,}:?")
 
-    Translates **each paragraph independently** (split on ``\n\n``) so
-    paragraph breaks never pass through the API.  Very long paragraphs
-    are further split into chunks at natural boundaries.  This avoids
-    the sentinel-token fragility of earlier approaches.
-    """
-    if not text or not text.strip():
-        return text
 
-    paragraphs = text.split("\n\n")
-    translated_paras: list[str] = []
-
-    for para in paragraphs:
-        stripped = para.strip()
-        if not stripped:
-            translated_paras.append(para)
+def _translate_table(table: str, source: str, target: str) -> str:
+    """Translate the cell contents of a markdown table, keeping its structure."""
+    lines = [ln.strip() for ln in table.strip().splitlines()]
+    out: list[str] = []
+    cache: dict[str, str] = {}
+    for ln in lines:
+        if not ln.startswith("|"):
+            out.append(ln)
             continue
-
-        # Short paragraph → translate as-is
-        if len(para) <= chunk_size:
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if all(_SEP_CELL_RE.fullmatch(c) for c in cells):
+            out.append(ln)  # separator row kept verbatim
+            continue
+        translated: list[str] = []
+        for c in cells:
+            # Numbers/symbol-only cells are left untouched (faster, safer).
+            if not c or not re.search(r"[A-Za-z]", c):
+                translated.append(c)
+                continue
+            if c in cache:
+                translated.append(cache[c])
+                continue
             try:
-                translated_paras.append(
-                    _gt_translate_one(para, source, target)
-                )
+                res = _gt_translate_one(c, source, target).strip()
             except Exception:
-                translated_paras.append(para)
-            continue
+                res = c
+            cache[c] = res
+            translated.append(res)
+        out.append("| " + " | ".join(translated) + " |")
+    return "\n".join(out)
 
-        # Long paragraph → split into sub-chunks at sentence-ish boundaries
-        # (period + space, newline, or comma in a pinch)
+
+def _translate_paragraph(
+    para: str, source: str, target: str, chunk_size: int
+) -> str:
+    """Translate one paragraph, protecting markdown tables and image links."""
+    protected: dict[str, str] = {}
+
+    def _protect(kind: str, value: str) -> str:
+        tok = f"@@{kind}{len(protected)}@@"
+        protected[tok] = value
+        return tok
+
+    # Image links: never send URLs to the translator.
+    para = _MD_IMAGE_RE.sub(lambda m: _protect("IMG", m.group(0)), para)
+
+    # Tables: translate their cells, then protect the rebuilt table.
+    def _table_repl(m):
+        return _protect("TBL", _translate_table(m.group(0), source, target))
+
+    para = _MD_TABLE_RE.sub(_table_repl, para)
+
+    # Nothing left to translate (only protected tokens) → skip the API call.
+    if not re.search(r"[^\W\d_]", re.sub(r"@@[A-Z]+\d+@@", "", para)):
+        out = para
+    elif len(para) <= chunk_size:
+        try:
+            out = _gt_translate_one(para, source, target)
+        except Exception:
+            out = para
+    else:
+        # Long paragraph → split at sentence-ish boundaries.
         sub_paras = re.split(r"(?<=[.!?])\s+", para)
         sub_chunks: list[str] = []
         current: list[str] = []
         cur_len = 0
-
         for sub in sub_paras:
             if cur_len + len(sub) > chunk_size and current:
                 sub_chunks.append(" ".join(current))
@@ -479,18 +529,43 @@ def translate_text_google(
             cur_len += len(sub)
         if current:
             sub_chunks.append(" ".join(current))
-
-        # Translate each sub-chunk, rejoin with space
         sub_translated: list[str] = []
         for ch in sub_chunks:
             try:
-                sub_translated.append(
-                    _gt_translate_one(ch, source, target)
-                )
+                sub_translated.append(_gt_translate_one(ch, source, target))
             except Exception:
                 sub_translated.append(ch)
-        translated_paras.append(" ".join(sub_translated))
+        out = " ".join(sub_translated)
 
+    # Google may add spaces around/inside tokens; normalize them back.
+    out = re.sub(r"@@\s*([A-Z]+)\s*(\d+)\s*@@", r"@@\1\2@@", out)
+    for tok, value in protected.items():
+        out = out.replace(tok, value)
+    return out
+
+
+def translate_text_google(
+    text: str, source: str = "en", target: str = "it", chunk_size: int = 1500
+) -> str:
+    """Translate text using Google Translate's public API.
+
+    Translates **each paragraph independently** (split on ``\n\n``) so
+    paragraph breaks never pass through the API.  Markdown tables and image
+    links are protected so Google doesn't mangle their syntax; table cell
+    contents are translated individually.
+    """
+    if not text or not text.strip():
+        return text
+
+    paragraphs = text.split("\n\n")
+    translated_paras: list[str] = []
+    for para in paragraphs:
+        if not para.strip():
+            translated_paras.append(para)
+            continue
+        translated_paras.append(
+            _translate_paragraph(para, source, target, chunk_size)
+        )
     return "\n\n".join(translated_paras)
 
 
@@ -659,6 +734,7 @@ class TranslatablePanel(QWidget):
 
         self._btn_original = QPushButton("📄 Originale")
         self._btn_translated = QPushButton("🇮🇹 Italiano")
+        self._btn_images = QPushButton("🖼️ Immagini")
 
         tab_style = """
             QPushButton {
@@ -673,7 +749,7 @@ class TranslatablePanel(QWidget):
                 border-color: #ddd; font-weight: bold;
             }
         """
-        for btn in (self._btn_original, self._btn_translated):
+        for btn in (self._btn_original, self._btn_translated, self._btn_images):
             btn.setCheckable(True)
             btn.setFlat(True)
             btn.setStyleSheet(tab_style)
@@ -694,18 +770,31 @@ class TranslatablePanel(QWidget):
         layout.addWidget(self._tab_bar)
         layout.addWidget(self.text_panel)
 
+        # ── Images panel (gallery of extracted figures) ────────────────
+        self.images_panel = QScrollArea()
+        self.images_panel.setWidgetResizable(True)
+        self.images_panel.setStyleSheet(
+            "QScrollArea { background: #f5f5f5; border: none; }"
+        )
+        self.images_panel.hide()
+        layout.addWidget(self.images_panel)
+
         # ── State ──────────────────────────────────────────────────────
         self._original_text: str = ""
         self._translated_text: str = ""
         self._render_md: bool = True
         self._page_translation_cache: dict[int, str] = {}
         self._current_page: int = -1
+        self._images: list[str] = []  # file:// URIs of current page figures
         self._thread: TranslateThread | None = None
         self._generation: int = 0  # monotonically increasing; ignore stale results
 
         # ── Connections ────────────────────────────────────────────────
         self._btn_original.clicked.connect(self._on_show_original)
         self._btn_translated.clicked.connect(self._on_show_translated)
+        self._btn_images.clicked.connect(self._on_show_images)
+
+        self._rebuild_images_panel()
 
     def show_text(
         self,
@@ -713,14 +802,21 @@ class TranslatablePanel(QWidget):
         as_markdown: bool = True,
         page_num: int = -1,
         force_retranslate: bool = False,
+        images: list[str] | None = None,
     ):
         """Display text and prepare translation.
 
         If ``page_num`` is provided, the translation is cached per page.
+        ``images`` are the file:// URIs of the figures extracted for the page.
         """
         self._render_md = as_markdown
         self._original_text = text
         self._current_page = page_num
+        self._images = list(images or [])
+        self._rebuild_images_panel()
+
+        if self._btn_images.isChecked():
+            return  # images tab active — gallery already rebuilt above
 
         if self._btn_translated.isChecked():
             # Translated tab is active — retranslate for the new page
@@ -746,12 +842,18 @@ class TranslatablePanel(QWidget):
     def _on_show_original(self):
         self._btn_original.setChecked(True)
         self._btn_translated.setChecked(False)
+        self._btn_images.setChecked(False)
+        self.images_panel.hide()
+        self.text_panel.show()
         self.text_panel.show_text(self._original_text, as_markdown=self._render_md)
         self._lbl_spinner.setText("")
 
     def _on_show_translated(self):
         self._btn_original.setChecked(False)
         self._btn_translated.setChecked(True)
+        self._btn_images.setChecked(False)
+        self.images_panel.hide()
+        self.text_panel.show()
 
         # Check cache
         if (
@@ -765,6 +867,121 @@ class TranslatablePanel(QWidget):
             self._lbl_spinner.setText("")
         else:
             self._start_translation(self._original_text)
+
+    def _on_show_images(self):
+        self._btn_original.setChecked(False)
+        self._btn_translated.setChecked(False)
+        self._btn_images.setChecked(True)
+        self.text_panel.hide()
+        self.images_panel.show()
+        self._rebuild_images_panel()
+        self._lbl_spinner.setText("")
+
+    # ── Images gallery ─────────────────────────────────────────────────
+
+    def _rebuild_images_panel(self):
+        """Rebuild the gallery from the current page's figure URIs."""
+        container = QWidget()
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        if not self._images:
+            hint = QLabel(
+                "Nessuna immagine estratta per questa pagina.\n\n"
+                "Seleziona il backend Docling 🧠 per estrarre e visualizzare le figure."
+            )
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #888; font-size: 14px; padding: 24px;")
+            lay.addWidget(hint)
+        else:
+            for uri in self._images:
+                lay.addWidget(self._make_image_card(uri))
+        lay.addStretch()
+
+        old = self.images_panel.takeWidget()
+        if old is not None:
+            old.deleteLater()
+        self.images_panel.setWidget(container)
+
+    def _make_image_card(self, uri: str) -> QWidget:
+        path = str(QUrl(uri).toLocalFile())
+        card = QWidget()
+        card.setObjectName("imgCard")
+        card.setStyleSheet(
+            "QWidget#imgCard { background: #fff; border: 1px solid #ddd;"
+            " border-radius: 6px; }"
+        )
+        v = QVBoxLayout(card)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        pix = QPixmap(path)
+        thumb = QLabel()
+        thumb.setPixmap(
+            pix.scaledToWidth(340, Qt.TransformationMode.SmoothTransformation)
+        )
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+        thumb.setToolTip("Clicca per ingrandire")
+        thumb.mousePressEvent = lambda _e, u=uri: self._show_image_full(u)
+        v.addWidget(thumb)
+
+        info = QLabel(f"{Path(path).name}  ·  {pix.width()}×{pix.height()} px")
+        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info.setStyleSheet("border: none; color: #555; font-size: 12px;")
+        v.addWidget(info)
+
+        row = QHBoxLayout()
+        btn_style = (
+            "QPushButton { background: #4a90d9; color: #fff; border: none;"
+            " border-radius: 4px; padding: 6px 12px; font-size: 12px; }"
+            "QPushButton:hover { background: #3a7ab5; }"
+        )
+        btn_save = QPushButton("💾 Salva")
+        btn_save.clicked.connect(lambda _=False, u=uri: self._save_image(u))
+        btn_copy = QPushButton("📋 Copia")
+        btn_copy.clicked.connect(lambda _=False, u=uri: self._copy_image(u))
+        for b in (btn_save, btn_copy):
+            b.setStyleSheet(btn_style)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            row.addWidget(b)
+        v.addLayout(row)
+        return card
+
+    def _show_image_full(self, uri: str):
+        path = str(QUrl(uri).toLocalFile())
+        dlg = QDialog(self)
+        dlg.setWindowTitle(Path(path).name)
+        dlg.resize(900, 720)
+        lay = QVBoxLayout(dlg)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        lbl = QLabel()
+        lbl.setPixmap(QPixmap(path))
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setWidget(lbl)
+        lay.addWidget(scroll)
+        dlg.exec()
+
+    def _copy_image(self, uri: str):
+        img = QImage(QUrl(uri).toLocalFile())
+        if not img.isNull():
+            QApplication.clipboard().setImage(img)
+            self._lbl_spinner.setText("✅ Copiata")
+
+    def _save_image(self, uri: str):
+        src = str(QUrl(uri).toLocalFile())
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salva immagine",
+            Path(src).name,
+            "PNG (*.png);;JPEG (*.jpg);;Tutti i file (*)",
+        )
+        if dest:
+            shutil.copyfile(src, dest)
+            self._lbl_spinner.setText("✅ Salvata")
 
     def _start_translation(self, text: str):
         """Fire background translation thread with generation tracking."""
@@ -941,6 +1158,11 @@ class MainWindow(QMainWindow):
         self._pdfoxide_doc = None    # cached pdf_oxide PdfDocument
         self._mupdf_doc = None       # cached pymupdf Document (render engine)
         self._qtpdf_doc = None       # cached QPdfDocument (render engine)
+        self._docling_converter = None   # cached Docling converter (reused)
+        self._docling_images_dir: Path | None = None  # dir for extracted figures
+        self._docling_cache: dict[int, str] = {}  # page (0-based) -> markdown
+        self._docling_image_uris: dict[int, list[str]] = {}  # page -> file:// URIs
+        self._current_images: list[str] = []  # figures for the current page
         self._render_scale: float = 3.0
         self._render_md: bool = True  # toggle Markdown rendering
 
@@ -1082,6 +1304,11 @@ class MainWindow(QMainWindow):
         self.page_spin = QSpinBox()
         self.page_spin.setMinimum(1)
         self.page_spin.setValue(1)
+        # Keyboard tracking off: with it on, every keystroke committed a value
+        # and fired valueChanged -> _set_page -> full page render + text
+        # extraction (Docling ~2-6s), freezing the box while typing. Now the
+        # page changes only on Enter / focus-out (arrows still work instantly).
+        self.page_spin.setKeyboardTracking(False)
         self.page_spin.valueChanged.connect(self._on_spin)
         self.page_spin.setEnabled(False)
         bar.addWidget(self.page_spin)
@@ -1146,7 +1373,7 @@ class MainWindow(QMainWindow):
         self.backend_combo.setToolTip(
             "Motore di estrazione testo  |  Ctrl+B per ruotare\n"
             "PyMuPDF4LLM ⚡: Markdown nativo, tabelle, ~0.8s\n"
-            "Docling 🧠: AI, massima qualità, ~25s (CPU)\n"
+            "Docling 🧠: AI, massima qualità, ~2-4s (CPU, dopo il primo caricamento)\n"
             "Smart (tabelle): tabelle ASCII + pdfminer\n"
             "pdf_oxide 🦀: Rust, Markdown+tabelle, MIT license, ~0.5s\n"
             "pdfminer.six: buon flusso paragrafi (~2s)\n"
@@ -1170,10 +1397,14 @@ class MainWindow(QMainWindow):
         self.fix_combo.currentTextChanged.connect(self._on_fix_changed)
         bar.addWidget(self.fix_combo)
 
-    def _display_text(self, text: str, page_num: int = -1):
+    def _display_text(
+        self, text: str, page_num: int = -1, images: list[str] | None = None
+    ):
         """Display extracted text respecting the current MD toggle."""
+        if images is None:
+            images = self._current_images
         self.text_panel.show_text(
-            text, as_markdown=self._render_md, page_num=page_num
+            text, as_markdown=self._render_md, page_num=page_num, images=images
         )
 
     def _toggle_markdown(self):
@@ -1215,6 +1446,9 @@ class MainWindow(QMainWindow):
         else:
             text = "(backend sconosciuto)"
 
+        # Track the figures extracted for this page (Docling only populates it).
+        self._current_images = self._docling_image_uris.get(page_num, [])
+
         # Apply the selected layout fix
         text = self._apply_fix(text, page_num)
 
@@ -1233,17 +1467,78 @@ class MainWindow(QMainWindow):
         except Exception as e:
             return f"(errore pymupdf4llm: {e})"
 
+    def _get_docling_converter(self):
+        """Build (once, lazily) the Docling converter with picture images enabled."""
+        if self._docling_converter is None and _has_docling:
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.images_scale = 2.0
+            pipeline_options.generate_picture_images = True
+            self._docling_converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=pipeline_options
+                    )
+                }
+            )
+        return self._docling_converter
+
+    def _save_docling_images(self, result, page_num: int) -> list[str]:
+        """Extract Docling PictureItems for a page into a temp dir (file:// URIs)."""
+        if self._docling_images_dir is None:
+            self._docling_images_dir = (
+                Path.home()
+                / ".local"
+                / "share"
+                / "noesis-pdf-reader"
+                / "images"
+                / self._pdf_path.stem
+            )
+        self._docling_images_dir.mkdir(parents=True, exist_ok=True)
+        prefix = f"page_{page_num + 1:04d}_img_"
+        for old in self._docling_images_dir.glob(prefix + "*.png"):
+            old.unlink(missing_ok=True)
+
+        uris: list[str] = []
+        i = 0
+        for element, _level in result.document.iterate_items():
+            if not isinstance(element, PictureItem):
+                continue
+            try:
+                img = element.get_image(result.document)
+            except Exception:
+                continue
+            if img is None:
+                continue
+            path = self._docling_images_dir / f"{prefix}{i}.png"
+            img.convert("RGB").save(path)
+            uris.append(path.resolve().as_uri())
+            i += 1
+        return uris
+
     def _extract_docling(self, page_num: int) -> str:
-        """Docling (IBM): AI-powered, best quality, slow on CPU (~25s/pag)."""
+        """Docling (IBM): AI quality; ~2-4s/pag after the first model load.
+
+        Results are cached per page so revisiting a page doesn't re-run the
+        conversion (and doesn't re-extract its figures).
+        """
         if not _has_docling:
             return "(docling non installato — esegui: pip install docling)"
+        if page_num in self._docling_cache:
+            return self._docling_cache[page_num]
         try:
-            converter = DocumentConverter()
+            converter = self._get_docling_converter()
             result = converter.convert(
                 str(self._pdf_path), page_range=(page_num + 1, page_num + 1)
             )
-            md = result.document.export_to_markdown()
-            return md.strip() or "(nessun testo estraibile su questa pagina)"
+            placeholder = "!!PIC!!"
+            md = result.document.export_to_markdown(image_placeholder=placeholder)
+            uris = self._save_docling_images(result, page_num)
+            for uri in uris:
+                md = md.replace(placeholder, f"![figura]({uri})", 1)
+            out = clean_text(md).strip() or "(nessun testo estraibile su questa pagina)"
+            self._docling_cache[page_num] = out
+            self._docling_image_uris[page_num] = uris
+            return out
         except Exception as e:
             return f"(errore docling: {e})"
 
@@ -1590,6 +1885,10 @@ class MainWindow(QMainWindow):
 
             self._plumber_cache.clear()
             self._pdfoxide_doc = None
+            self._docling_images_dir = None
+            self._docling_cache.clear()
+            self._docling_image_uris.clear()
+            self._current_images = []
             self.text_panel.invalidate_cache()
 
             self.page_spin.setEnabled(True)

@@ -12,6 +12,9 @@ build/
 .venv/
 venv/
 
+# Benchmark outputs
+benchmark/out/
+
 # IDE
 .idea/
 .vscode/
