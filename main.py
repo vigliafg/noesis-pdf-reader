@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -707,6 +708,81 @@ class TranslateThread(QThread):
         self.result_ready.emit(self._generation, translated)
 
 
+class DoclingExtractThread(QThread):
+    """Single background worker for Docling extraction (current page first,
+    then prefetched pages), keeping the UI responsive.
+
+    Docling's ``DocumentConverter`` is not thread-safe, so all conversions are
+    serialized on this one thread.
+    """
+
+    # generation, page (0-based), markdown, image_uris, elapsed_secs
+    page_ready = pyqtSignal(int, int, str, list, float)
+
+    def __init__(self, extract_fn, parent=None):
+        super().__init__(parent)
+        self._extract_fn = extract_fn  # (page:int) -> (md:str, uris:list[str])
+        self._cond = threading.Condition()
+        self._priority: list[tuple[int, int]] = []  # (generation, page)
+        self._prefetch: list[tuple[int, int]] = []  # (generation, page)
+        self._stop = False
+
+    def request_current(self, page: int, generation: int):
+        with self._cond:
+            self._priority = [(g, p) for g, p in self._priority if p != page]
+            self._prefetch = [(g, p) for g, p in self._prefetch if p != page]
+            self._priority.insert(0, (generation, page))
+            self._cond.notify()
+
+    def request_prefetch(self, pages, generation: int):
+        with self._cond:
+            cur = {p for _, p in self._priority}
+            have = {p for _, p in self._prefetch}
+            for p in pages:
+                if p not in cur and p not in have:
+                    self._prefetch.append((generation, p))
+            self._cond.notify()
+
+    def clear_prefetch(self):
+        with self._cond:
+            self._prefetch.clear()
+
+    def reset(self):
+        with self._cond:
+            self._priority.clear()
+            self._prefetch.clear()
+
+    def stop(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify()
+
+    def _next_locked(self):
+        if self._priority:
+            return self._priority.pop(0)
+        if self._prefetch:
+            return self._prefetch.pop(0)
+        return None
+
+    def run(self):
+        while True:
+            with self._cond:
+                item = self._next_locked()
+                while item is None and not self._stop:
+                    self._cond.wait(timeout=1.0)
+                    item = self._next_locked()
+                if item is None and self._stop:
+                    return
+            generation, page = item
+            try:
+                t0 = time.perf_counter()
+                md, uris = self._extract_fn(page)
+                elapsed = time.perf_counter() - t0
+            except Exception:
+                continue
+            self.page_ready.emit(generation, page, md, uris, elapsed)
+
+
 class TranslatablePanel(QWidget):
     """Wraps TextPanel with a tab bar to switch between original and Italian."""
 
@@ -1163,6 +1239,8 @@ class MainWindow(QMainWindow):
         self._docling_cache: dict[int, str] = {}  # page (0-based) -> markdown
         self._docling_image_uris: dict[int, list[str]] = {}  # page -> file:// URIs
         self._current_images: list[str] = []  # figures for the current page
+        self._docling_worker = None  # background Docling extractor (lazy)
+        self._docling_generation: int = 0  # bumped on each PDF open
         self._render_scale: float = 3.0
         self._render_md: bool = True  # toggle Markdown rendering
 
@@ -1449,6 +1527,10 @@ class MainWindow(QMainWindow):
         # Track the figures extracted for this page (Docling only populates it).
         self._current_images = self._docling_image_uris.get(page_num, [])
 
+        # Docling cache miss → extraction runs in background; show a hint.
+        if text is None:
+            return "⏳ Estrazione in corso…", time.perf_counter() - t0
+
         # Apply the selected layout fix
         text = self._apply_fix(text, page_num)
 
@@ -1515,32 +1597,72 @@ class MainWindow(QMainWindow):
             i += 1
         return uris
 
-    def _extract_docling(self, page_num: int) -> str:
-        """Docling (IBM): AI quality; ~2-4s/pag after the first model load.
+    def _docling_extract_page(self, page_num: int) -> tuple[str, list[str]]:
+        """Run Docling on one page (worker-thread side). Returns (md, image_uris)."""
+        converter = self._get_docling_converter()
+        result = converter.convert(
+            str(self._pdf_path), page_range=(page_num + 1, page_num + 1)
+        )
+        placeholder = "!!PIC!!"
+        md = result.document.export_to_markdown(image_placeholder=placeholder)
+        uris = self._save_docling_images(result, page_num)
+        for uri in uris:
+            md = md.replace(placeholder, f"![figura]({uri})", 1)
+        md = clean_text(md).strip() or "(nessun testo estraibile su questa pagina)"
+        return md, uris
 
-        Results are cached per page so revisiting a page doesn't re-run the
-        conversion (and doesn't re-extract its figures).
-        """
+    def _extract_docling(self, page_num: int) -> str | None:
+        """Docling: return cached markdown, or None and schedule background work."""
         if not _has_docling:
             return "(docling non installato — esegui: pip install docling)"
         if page_num in self._docling_cache:
             return self._docling_cache[page_num]
-        try:
-            converter = self._get_docling_converter()
-            result = converter.convert(
-                str(self._pdf_path), page_range=(page_num + 1, page_num + 1)
+        self._ensure_docling_worker()
+        self._docling_worker.request_current(page_num, self._docling_generation)
+        return None
+
+    def _ensure_docling_worker(self):
+        if self._docling_worker is None and _has_docling:
+            self._docling_worker = DoclingExtractThread(
+                self._docling_extract_page, self
             )
-            placeholder = "!!PIC!!"
-            md = result.document.export_to_markdown(image_placeholder=placeholder)
-            uris = self._save_docling_images(result, page_num)
-            for uri in uris:
-                md = md.replace(placeholder, f"![figura]({uri})", 1)
-            out = clean_text(md).strip() or "(nessun testo estraibile su questa pagina)"
-            self._docling_cache[page_num] = out
-            self._docling_image_uris[page_num] = uris
-            return out
-        except Exception as e:
-            return f"(errore docling: {e})"
+            self._docling_worker.page_ready.connect(self._on_docling_page_ready)
+            self._docling_worker.start()
+        return self._docling_worker
+
+    def _on_docling_page_ready(self, generation, page_num, md, uris, elapsed):
+        """Slot: a background Docling extraction finished."""
+        if generation != self._docling_generation:
+            return  # stale result from a previous document
+        self._docling_cache[page_num] = md
+        self._docling_image_uris[page_num] = uris
+        if page_num != self._current_page:
+            return  # prefetched page — cached for later
+        self._current_images = uris
+        text = self._apply_fix(md, page_num)
+        self._display_text(
+            self._extraction_header(text, elapsed) + text,
+            page_num=page_num,
+            images=uris,
+        )
+        self.status_bar.showMessage(
+            f"Pagina {page_num + 1} di {self._page_count}"
+            f"  —  {self._pdf_path.name}"
+            f"  |  Testo: {self.backend_combo.currentText()} ({elapsed*1000:.0f} ms)"
+        )
+
+    def _schedule_prefetch(self, page_num: int):
+        """Queue the next 5 pages for background extraction (Docling only)."""
+        if self.backend_combo.currentText() != "Docling 🧠" or not _has_docling:
+            return
+        worker = self._ensure_docling_worker()
+        worker.clear_prefetch()
+        pending = [
+            p for p in range(page_num + 1, min(page_num + 6, self._page_count))
+            if p not in self._docling_cache
+        ]
+        if pending:
+            worker.request_prefetch(pending, self._docling_generation)
 
     def _extract_pdfium(self, page_num: int) -> str:
         """Use pypdfium2's built-in text extraction (instant — doc already open)."""
@@ -1656,6 +1778,9 @@ class MainWindow(QMainWindow):
 
         # Sync TOC highlight
         self.toc_panel.select_page(page_num)
+
+        # Prefetch the next pages in background (Docling only).
+        self._schedule_prefetch(page_num)
 
     def _next_page(self):
         self._set_page(self._current_page + 1)
@@ -1889,6 +2014,9 @@ class MainWindow(QMainWindow):
             self._docling_cache.clear()
             self._docling_image_uris.clear()
             self._current_images = []
+            self._docling_generation += 1
+            if self._docling_worker is not None:
+                self._docling_worker.reset()
             self.text_panel.invalidate_cache()
 
             self.page_spin.setEnabled(True)
@@ -1921,6 +2049,12 @@ class MainWindow(QMainWindow):
             self._qtpdf_doc = None
         self._plumber_cache.clear()
         self._pdfoxide_doc = None
+        if self._docling_worker is not None:
+            self._docling_worker.stop()
+            # Only drop the reference if the thread actually finished, to avoid
+            # destroying a still-running QThread.
+            if self._docling_worker.wait(5000):
+                self._docling_worker = None
         super().closeEvent(event)
 
 
