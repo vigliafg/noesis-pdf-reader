@@ -30,8 +30,10 @@ from main import (  # noqa: E402
     _collect_blocks,
     _column_aware_markdown,
     _detect_column_split,
+    _detect_column_splits,
     _page_needs_column_reorder,
     _spacing_fixes,
+    _split_cross_column_paragraphs,
     _table_to_md,
 )
 
@@ -43,6 +45,7 @@ LEFT = (50, 250)
 RIGHT = (320, 520)
 
 REAL_PDF = os.path.join(_ROOT, "harrison2025.pdf")
+REAL_CECIL_PDF = os.path.join(_ROOT, "cecil2024.pdf")
 
 
 def _new_page(width=PAGE_W, height=PAGE_H):
@@ -165,6 +168,35 @@ class DetectColumnSplitTests(unittest.TestCase):
     def test_single_column_returns_none(self):
         blocks = [self._block(50, 200), self._block(55, 190)]
         self.assertIsNone(_detect_column_split(blocks, PAGE_W))
+
+    def test_four_columns_return_three_splits(self):
+        # A four-column index page: three column boundaries.
+        blocks = [
+            self._block(48, 173), self._block(50, 170),
+            self._block(190, 319), self._block(195, 315),
+            self._block(332, 458), self._block(335, 455),
+            self._block(473, 600), self._block(475, 598),
+        ]
+        splits = _detect_column_splits(blocks, PAGE_W)
+        self.assertEqual(len(splits), 3)
+        self.assertLess(splits[0], splits[1])
+        self.assertLess(splits[1], splits[2])
+        # Boundaries sit in the gaps between the columns.
+        self.assertTrue(173 < splits[0] < 190)
+        self.assertTrue(319 < splits[1] < 332)
+        self.assertTrue(458 < splits[2] < 473)
+
+    def test_margin_label_is_not_a_column(self):
+        # A narrow side label next to two real columns must not produce a split
+        # before the left column (the widest-gap wrapper returns the real one).
+        blocks = [
+            self._block(14, 29),   # narrow vertical margin label
+            self._block(39, 295), self._block(45, 290),
+            self._block(304, 560), self._block(310, 555),
+        ]
+        self.assertEqual(_detect_column_split(blocks, PAGE_W), (295 + 304) / 2)
+        splits = _detect_column_splits(blocks, PAGE_W)
+        self.assertEqual(len(splits), 1)
 
 
 class PageNeedsColumnReorderTests(unittest.TestCase):
@@ -299,8 +331,100 @@ class ColumnAwareTests(unittest.TestCase):
         self.assertLess(md.index("| Alpha | 42 |"), md.index("Left below."))
         doc.close()
 
+    def test_single_column_table_does_not_split_other_column(self):
+        # A table inside the LEFT column only: it must stay in the left
+        # column's flow, not split the right column into two bands.
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 90, 250, 140), "Left above.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 150, 520, 200), "Right above.", fontsize=10)
+        _add_table(page, (50, 300, 250, 390), [["Name", "Value"], ["Alpha", "42"]])
+        page.insert_textbox(pymupdf.Rect(50, 440, 250, 490), "Left below.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 500, 520, 550), "Right below.", fontsize=10)
+
+        md = _column_aware_markdown(page, move_title=False)
+        # The whole left column (incl. its table) is emitted before the right
+        # column, which must stay in one piece (top-to-bottom).
+        self.assertLess(md.index("Left below."), md.index("Right above."))
+        self.assertLess(md.index("Right above."), md.index("Right below."))
+        self.assertIn("| Name | Value |", md)  # the table itself is kept
+        doc.close()
+
+    def test_small_font_references_are_kept(self):
+        # References/index entries are 7pt: the font filter must not drop them.
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 160), "1. Whelan JS, Davis LE.", fontsize=7)
+        page.insert_textbox(pymupdf.Rect(50, 180, 250, 220), "2. Meltzer PS, Helman LJ.", fontsize=7)
+        page.insert_textbox(pymupdf.Rect(320, 120, 520, 160), "12. von Mehren M, Kane JM.", fontsize=7)
+        page.insert_textbox(pymupdf.Rect(320, 180, 520, 220), "16. Farag S, Smith MJ.", fontsize=7)
+
+        md = _column_aware_markdown(page, move_title=False)
+        self.assertIn("Whelan JS, Davis LE.", md)
+        self.assertIn("von Mehren M, Kane JM.", md)
+        doc.close()
+
+    def test_line_break_hyphenation_is_fused(self):
+        # A word hyphenated across a line break must come out as one word,
+        # not "un- common".
+        doc, page = _new_page()
+        page.insert_textbox(
+            pymupdf.Rect(50, 120, 250, 200),
+            "severe thrombocytopenia or hypoprothrombinaemia is un-\ncommon.",
+            fontsize=9,
+        )
+        page.insert_textbox(pymupdf.Rect(50, 240, 250, 320), "More text here.", fontsize=9)
+        page.insert_textbox(pymupdf.Rect(320, 120, 520, 200), "Right column text.", fontsize=9)
+        page.insert_textbox(pymupdf.Rect(320, 240, 520, 320), "More right text.", fontsize=9)
+
+        md = _column_aware_markdown(page, move_title=False)
+        self.assertIn("uncommon", md)
+        self.assertNotIn("un- common", md)
+        doc.close()
+
+    def test_four_column_index_read_left_to_right(self):
+        doc, page = _new_page()
+        # Scattered y positions so find_tables() does not mistake the layout
+        # for a data table (real index entries are not grid-aligned).
+        page.insert_textbox(pymupdf.Rect(48, 120, 173, 160), "Alpha entry one.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(48, 400, 173, 440), "Alpha entry two.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(190, 200, 319, 240), "Beta entry one.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(190, 320, 319, 360), "Beta entry two.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(332, 140, 458, 180), "Gamma entry one.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(332, 280, 458, 320), "Gamma entry two.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(473, 360, 600, 400), "Delta entry one.", fontsize=8)
+        page.insert_textbox(pymupdf.Rect(473, 450, 600, 490), "Delta entry two.", fontsize=8)
+
+        md = _column_aware_markdown(page, move_title=False)
+        self.assertLess(md.index("Alpha entry one."), md.index("Alpha entry two."))
+        self.assertLess(md.index("Alpha entry two."), md.index("Beta entry one."))
+        self.assertLess(md.index("Beta entry two."), md.index("Gamma entry one."))
+        self.assertLess(md.index("Gamma entry two."), md.index("Delta entry one."))
+        doc.close()
+
 
 @unittest.skipUnless(os.path.exists(REAL_PDF), "harrison2025.pdf not present")
+class CrossColumnSplitTests(unittest.TestCase):
+    def test_glued_paragraph_is_split_at_column_boundary(self):
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "Alpha beta gamma delta", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 220, 250, 300), "Epsilon zeta eta theta", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 120, 520, 200), "iota kappa lambda mu", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 220, 520, 300), "nu xi omicron pi", fontsize=10)
+
+        md = "Alpha beta gamma delta iota kappa lambda mu\n\nA short para."
+        out = _split_cross_column_paragraphs(md, page)
+        self.assertIn("Alpha beta gamma delta\n\niota kappa lambda mu", out)
+        self.assertIn("A short para.", out)  # short paragraphs pass through
+        doc.close()
+
+    def test_single_column_is_unchanged(self):
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "Only one column here", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 220, 250, 300), "More text below it", fontsize=10)
+        md = "Only one column here More text below it"
+        self.assertEqual(_split_cross_column_paragraphs(md, page), md)
+        doc.close()
+
+
 class RealPdfRegressionTests(unittest.TestCase):
     """Regression checks on the pages that originally motivated the fixes."""
 
@@ -321,6 +445,54 @@ class RealPdfRegressionTests(unittest.TestCase):
     def test_page_156_table_rendered_as_markdown(self):
         md = _column_aware_markdown(self.doc[155], move_title=False)
         self.assertIn("| ---", md)
+
+    def test_page_157_top_of_right_column_paragraph_in_order(self):
+        md = _column_aware_markdown(self.doc[156], move_title=False)
+        target = "treatment of both tension-type headache"
+        self.assertIn(target, md)
+        # Correct reading order: the left column (incl. its final list item)
+        # ends, then the right column starts with this paragraph.
+        self.assertLess(md.index("region of temporal artery"), md.index(target))
+        self.assertLess(
+            md.index(target), md.index("Underlying recurrent headache disorders")
+        )
+
+    def test_page_157_docling_glue_is_split(self):
+        # Docling's layout model glues the last cell of TABLE 17-2 to the right
+        # column's opening sentence; the fix must re-split them.
+        glued = (
+            "Pain associated with local tenderness, e.g., region of temporal "
+            "artery treatment of both tension-type headache and migraine, each "
+            "symptom must be treated optimally."
+        )
+        out = _split_cross_column_paragraphs(glued, self.doc[156])
+        self.assertNotIn("artery treatment", out)
+        self.assertIn("treatment of both tension-type headache", out)
+
+
+@unittest.skipUnless(os.path.exists(REAL_CECIL_PDF), "cecil2024.pdf not present")
+class CecilPdfRegressionTests(unittest.TestCase):
+    """Regression checks on Cecil layouts: references and multi-column index."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = pymupdf.open(REAL_CECIL_PDF)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.doc.close()
+
+    def test_page_2117_references_are_not_dropped(self):
+        # 7pt reference entries must survive the font filter.
+        md = _column_aware_markdown(self.doc[2116], move_title=False)
+        self.assertIn("Whelan JS", md)
+        self.assertIn("von Mehren M", md)
+
+    def test_page_4382_index_columns_in_order(self):
+        # Four-column index: column 1 must be read before column 4.
+        md = _column_aware_markdown(self.doc[4381], move_title=False)
+        self.assertLess(md.index("Dermatomyositis"), md.index("Diazepam"))
+        self.assertIn("nordiazepam", md)
 
 
 if __name__ == "__main__":

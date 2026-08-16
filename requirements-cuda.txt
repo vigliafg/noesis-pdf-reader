@@ -1,0 +1,8 @@
+# Full tier: medium + CUDA. Same as requirements-docling.txt, but torch is
+# installed with CUDA support so Docling runs on the GPU.
+#
+#     pip install torch --index-url https://download.pytorch.org/whl/cu124
+#     pip install -r requirements-cuda.txt
+#
+# (cu124 = CUDA 12.4; adjust the index to match the CUDA driver installed.)
+-r requirements-docling.txt

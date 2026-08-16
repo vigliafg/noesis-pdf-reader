@@ -1,0 +1,10 @@
+# Medium tier: light + Docling (AI quality backend), torch CPU-only.
+#
+# IMPORTANT: install CPU-only torch FIRST so pip never pulls the huge CUDA
+# build from PyPI (~6 GB). Do not `pip install -r requirements-docling.txt`
+# directly on a fresh environment; instead run:
+#
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#     pip install -r requirements-docling.txt
+-r requirements.txt
+docling>=2.0

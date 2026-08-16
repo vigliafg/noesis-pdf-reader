@@ -10,10 +10,16 @@ build/
 
 # Virtual env
 .venv/
+.venv-build/
 venv/
 
 # Benchmark outputs
 benchmark/out/
+
+# Release archives (built locally)
+*.zip
+*.tar.gz
+*.dmg
 
 # IDE
 .idea/

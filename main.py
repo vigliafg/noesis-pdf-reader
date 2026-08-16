@@ -22,6 +22,10 @@ import markdown as _md_lib
 
 _MD_EXTENSIONS = ["tables", "fenced_code", "codehilite"]
 
+# Shown in place of the text while Docling extracts a page in background.
+# Must never be translated or cached as a real page translation.
+_EXTRACTING_PLACEHOLDER = "⏳ Estrazione in corso…"
+
 try:
     import pymupdf4llm
     _has_pymupdf4llm = True
@@ -66,8 +70,13 @@ except ImportError:
     QPdfDocument = None  # type: ignore
     _has_qtpdf = False
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QSize, QUrl, QStandardPaths
-from PyQt6.QtGui import QImage, QPixmap, QFont, QKeySequence, QShortcut
+from PyQt6.QtCore import (
+    Qt, QThread, QTimer, pyqtSignal, QSize, QUrl, QStandardPaths, QRectF,
+)
+from PyQt6.QtGui import (
+    QImage, QPixmap, QFont, QKeySequence, QShortcut,
+    QPen, QBrush, QColor, QPainter,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -89,6 +98,12 @@ from PyQt6.QtWidgets import (
     QDockWidget,
     QTreeWidget,
     QTreeWidgetItem,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
+    QGraphicsTextItem,
+    QFrame,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -148,6 +163,68 @@ def _format_table_ascii(table: list[list[str | None]], max_col_width: int = 28) 
     return "\n".join(lines)
 
 
+def _page_embedded_images(doc, page_num: int) -> list[tuple[bytes, str]]:
+    """Return ``[(raw_bytes, ext), ...]`` for a page's embedded raster images."""
+    out: list[tuple[bytes, str]] = []
+    if not _has_pymupdf:
+        return out
+    try:
+        page = doc[page_num]
+    except Exception:
+        return out
+    seen: set[int] = set()
+    for img in page.get_images(full=True):
+        xref = img[0]
+        if xref in seen:
+            continue
+        seen.add(xref)
+        try:
+            info = doc.extract_image(xref)
+        except Exception:
+            continue
+        data = info.get("image")
+        if data:
+            out.append((data, (info.get("ext") or "png").lower()))
+    return out
+
+
+def _region_image(
+    doc, page_num: int, clip, zoom: float
+) -> tuple[bytes, str] | None:
+    """Extract the image under a PDF-points rect as ``(bytes, ext)``.
+
+    Prefers the original embedded raster when one fully covers the selection;
+    otherwise renders the region (whole figure, also for composite/vector
+    figures). Returns None when nothing can be extracted.
+    """
+    if not _has_pymupdf:
+        return None
+    try:
+        page = doc[page_num]
+        rect = pymupdf.Rect(clip)
+        if rect.width < 1.0 or rect.height < 1.0:
+            return None
+
+        # 1) embedded image whose placement is fully inside the selection
+        for img in page.get_images(full=True):
+            xref = img[0]
+            for r in page.get_image_rects(xref):
+                if (
+                    r.x0 >= rect.x0 and r.y0 >= rect.y0
+                    and r.x1 <= rect.x1 and r.y1 <= rect.y1
+                ):
+                    info = doc.extract_image(xref)
+                    data = info.get("image")
+                    if data:
+                        return data, (info.get("ext") or "png").lower()
+
+        # 2) fallback: render the selected region at high resolution
+        pix = page.get_pixmap(clip=rect, matrix=pymupdf.Matrix(zoom, zoom))
+        return pix.tobytes("png"), "png"
+    except Exception:
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  layout fixes (generic corrections for two-column / chapter-open pages)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -178,6 +255,24 @@ def _collect_blocks(page) -> list[dict]:
                 max_size = max(max_size, s["size"])
             if spans:
                 lines.append(spans)
+        # De-hyphenate words split across a line break ("un-" + "common" →
+        # "uncommon"). Only when the next line starts lowercase, so real
+        # hyphenated compounds at line ends are left alone.
+        if lines:
+            fused: list[list[dict]] = [lines[0]]
+            for nxt in lines[1:]:
+                cur = fused[-1]
+                if (
+                    cur and nxt
+                    and cur[-1]["text"].endswith("-")
+                    and len(cur[-1]["text"]) > 1
+                    and nxt[0]["text"][:1].islower()
+                ):
+                    cur[-1]["text"] = cur[-1]["text"][:-1] + nxt[0]["text"]
+                    nxt = nxt[1:]
+                if nxt:
+                    fused.append(nxt)
+            lines = fused
         if not lines:
             continue
         x0, y0, x1, y1 = blk["bbox"]
@@ -190,11 +285,15 @@ def _collect_blocks(page) -> list[dict]:
     return blocks
 
 
-def _detect_column_split(blocks: list[dict], page_width: float):
-    """Return the x boundary between two text columns, or None if single-column."""
+def _merged_column_intervals(blocks: list[dict], page_width: float) -> list[list[float]]:
+    """Merge narrow blocks into per-column x-intervals, dropping margin labels.
+
+    Margin labels, page numbers and vertical side labels are narrow (<40pt)
+    and must not be mistaken for a text column.
+    """
     col = [b for b in blocks if (b["x1"] - b["x0"]) < 0.6 * page_width]
     if len(col) < 4:
-        return None
+        return []
     intervals = sorted((b["x0"], b["x1"]) for b in col)
     merged = [list(intervals[0])]
     for x0, x1 in intervals[1:]:
@@ -202,6 +301,37 @@ def _detect_column_split(blocks: list[dict], page_width: float):
             merged[-1][1] = max(merged[-1][1], x1)
         else:
             merged.append([x0, x1])
+    # Drop narrow labels that sit in the outer page margins (page numbers,
+    # vertical side labels); narrow lines in the middle are real content.
+    return [
+        m for m in merged
+        if not ((m[1] - m[0]) < 40 and (m[0] < 30 or m[1] > page_width - 30))
+    ]
+
+
+def _detect_column_splits(blocks: list[dict], page_width: float) -> list[float]:
+    """Return the x boundaries between text columns (N-1 splits for N columns).
+
+    Handles any number of columns (two-column prose, three/four-column
+    indexes). Every gap between merged column intervals that is comparable to
+    the widest gap is a column boundary; narrow indentation/margin gaps are
+    dropped, so they never split a column.
+    """
+    merged = _merged_column_intervals(blocks, page_width)
+    if len(merged) < 2:
+        return []
+    gaps = [merged[i + 1][0] - merged[i][1] for i in range(len(merged) - 1)]
+    widest = max(gaps)
+    return [
+        (merged[i][1] + merged[i + 1][0]) / 2
+        for i, gap in enumerate(gaps)
+        if gap >= 8 and gap >= 0.55 * widest
+    ]
+
+
+def _detect_column_split(blocks: list[dict], page_width: float):
+    """Return the widest column boundary, or None if single-column."""
+    merged = _merged_column_intervals(blocks, page_width)
     if len(merged) < 2:
         return None
     best_gap = 0.0
@@ -306,17 +436,20 @@ def _table_to_md(page, table) -> str:
 
 
 def _column_aware_markdown(page, move_title: bool = False) -> str:
-    """Reconstruct a page in correct reading order (full-width → columns).
+    """Reconstruct a page in correct reading order.
 
-    Full-width blocks and data tables act as separators; the two text
-    columns are emitted band-by-band (left column then right) between them,
-    so tables in the middle of a page are no longer dropped.
+    Body text is decomposed into consecutive paragraphs, column by column:
+    within each band the left column is emitted top-to-bottom and then the
+    right column top-to-bottom. Only elements that span the full page width
+    (titles, full-width tables) act as horizontal separators between bands;
+    single-column tables stay inside their own column, so they never split
+    the other column. Every body paragraph is emitted exactly once.
     """
     page_width = page.rect.width
 
-    # Detect data tables (rendered as markdown) and exclude them from columns.
-    tables: list[tuple[float, str]] = []  # (y0, markdown)
+    # Detect data tables (rendered as markdown) and their bboxes.
     table_regions: list[tuple] = []
+    table_items: list[dict] = []  # {y0, x0, x1, md}
     try:
         tabs = page.find_tables()
     except Exception:
@@ -325,10 +458,13 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
         for t in tabs.tables:
             if t.row_count <= 1 and t.col_count <= 2:
                 continue  # likely a chapter-title block, not a data table
-            table_regions.append(tuple(t.bbox))
+            bbox = tuple(t.bbox)
+            table_regions.append(bbox)
             md = _table_to_md(page, t)
             if md:
-                tables.append((t.bbox[1], md))
+                table_items.append(
+                    {"y0": bbox[1], "x0": bbox[0], "x1": bbox[2], "md": md}
+                )
 
     def _inside(b: dict, r: tuple) -> bool:
         return (
@@ -336,37 +472,63 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
             and b["y0"] >= r[1] - 2 and b["y1"] <= r[3] + 2
         )
 
-    blocks = [b for b in _collect_blocks(page) if b["max_size"] >= 8.0]
+    blocks = [b for b in _collect_blocks(page) if b["max_size"] >= 6.5]
 
-    full_width: list[dict] = []
-    columns: list[dict] = []
+    full_width: list[dict] = []  # spans the page → separator
+    body: list[dict] = []        # column paragraphs (outside tables)
     for b in blocks:
         if any(_inside(b, r) for r in table_regions):
             continue  # covered by the markdown table
-        if (b["x1"] - b["x0"]) >= 0.6 * page_width:
+        w = b["x1"] - b["x0"]
+        if w >= 0.6 * page_width:
             full_width.append(b)
-        elif (b["x1"] - b["x0"]) >= 25:
-            columns.append(b)
+        elif w >= 25:
+            body.append(b)
 
-    # Separators: markdown tables + full-width blocks, sorted by y.
-    separators: list[tuple[float, str]] = list(tables)
-    for b in full_width:
-        md = _block_to_md(b, as_column=False)
-        if md:
-            separators.append((b["y0"], md))
-    separators.sort(key=lambda s: s[0])
+    # Robust column boundaries, computed from body paragraphs only.
+    # Handles two-column prose as well as three/four-column indexes.
+    splits = _detect_column_splits(body, page_width)
 
-    # Single-column fallback → treat everything as one column.
-    split = _detect_column_split(columns, page_width)
-    if split is None:
-        split = page_width + 1
+    def _col_of(x: float) -> int:
+        return sum(1 for s in splits if x > s)
 
     # Move chapter title(s) out of the column flow when requested.
     titles: list[dict] = []
     if move_title:
-        titles = [b for b in columns if b["max_size"] >= 14 and b["x0"] < split]
-        columns = [b for b in columns if b not in titles]
+        first_split = splits[0] if splits else page_width + 1
+        titles = [b for b in body if b["max_size"] >= 14 and b["x0"] < first_split]
+        body = [b for b in body if b not in titles]
         titles.sort(key=lambda b: b["max_size"])
+
+    # Full-width separators: full-width blocks + full-width tables only.
+    separators: list[tuple[float, str]] = []
+    for b in full_width:
+        md = _block_to_md(b, as_column=False)
+        if md:
+            separators.append((b["y0"], md))
+    for ti in table_items:
+        if (ti["x1"] - ti["x0"]) >= 0.6 * page_width:
+            separators.append((ti["y0"], ti["md"]))
+    separators.sort(key=lambda s: s[0])
+
+    # Column paragraphs, decomposed top-to-bottom: (y0, x0, md).
+    n_cols = len(splits) + 1
+    col_items: list[list[tuple[float, float, str]]] = [[] for _ in range(n_cols)]
+    for b in body:
+        md = _block_to_md(b, as_column=True)
+        if not md:
+            continue
+        item = (b["y0"], b["x0"], md)
+        col_items[_col_of((b["x0"] + b["x1"]) / 2)].append(item)
+    # Single-column tables belong to their column, at their y position.
+    for ti in table_items:
+        if (ti["x1"] - ti["x0"]) >= 0.6 * page_width:
+            continue
+        mid = (ti["x0"] + ti["x1"]) / 2
+        item = (ti["y0"], ti["x0"], ti["md"])
+        col_items[_col_of(mid)].append(item)
+    for items in col_items:
+        items.sort(key=lambda it: (it[0], it[1]))
 
     out: list[str] = []
     for t in titles:
@@ -374,32 +536,13 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
 
     sep_marks = [y0 for y0, _ in separators]
 
-    def _band(b: dict) -> int:
-        return sum(1 for sy in sep_marks if b["y0"] >= sy)
-
-    def _emit(blks: list[dict], as_column: bool):
-        for b in blks:
-            md = _block_to_md(b, as_column=as_column)
-            if md:
-                out.append(md)
+    def _band(y0: float) -> int:
+        return sum(1 for sy in sep_marks if y0 >= sy)
 
     n_seps = len(separators)
     for band_idx in range(n_seps + 1):
-        band_cols = [b for b in columns if _band(b) == band_idx]
-        _emit(
-            sorted(
-                [b for b in band_cols if b["x0"] < split],
-                key=lambda b: (b["y0"], b["x0"]),
-            ),
-            as_column=True,
-        )
-        _emit(
-            sorted(
-                [b for b in band_cols if b["x0"] >= split],
-                key=lambda b: (b["y0"], b["x0"]),
-            ),
-            as_column=True,
-        )
+        for items in col_items:
+            out.extend(md for y0, _x, md in items if _band(y0) == band_idx)
         if band_idx < n_seps:
             out.append(separators[band_idx][1])
 
@@ -435,7 +578,7 @@ def _page_needs_column_reorder(page) -> bool:
 
     blocks = [
         b for b in _collect_blocks(page)
-        if b["max_size"] >= 8.0 and not any(_inside(b, r) for r in table_regions)
+        if b["max_size"] >= 6.5 and not any(_inside(b, r) for r in table_regions)
     ]
     page_width = page.rect.width
     # Same column filter as _column_aware_markdown: narrow, but not stray marks.
@@ -443,12 +586,12 @@ def _page_needs_column_reorder(page) -> bool:
         b for b in blocks
         if (b["x1"] - b["x0"]) < 0.6 * page_width and (b["x1"] - b["x0"]) >= 25
     ]
-    split = _detect_column_split(columns, page_width)
-    if split is None:
+    splits = _detect_column_splits(columns, page_width)
+    if not splits:
         return False
 
-    left = [b for b in columns if b["x1"] <= split]
-    right = [b for b in columns if b["x0"] >= split]
+    left = [b for b in columns if b["x1"] <= splits[0]]
+    right = [b for b in columns if b["x0"] >= splits[0]]
     if len(left) < 2 or len(right) < 2:
         return False
 
@@ -457,6 +600,84 @@ def _page_needs_column_reorder(page) -> bool:
         for lb in left
         for rb in right
     )
+
+
+def _reading_normalize(text: str) -> str:
+    """Collapse whitespace + de-hyphenate line breaks, lowercased.
+
+    Used to align extracted markdown against pymupdf's per-column raw text
+    (the two may differ in line breaks and end-of-line hyphenation).
+    """
+    text = re.sub(r"-\s*\n\s*", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.lower().strip()
+
+
+def _longest_prefix_in(s: str, target: str) -> int:
+    """Length of the longest word-aligned prefix of ``s`` that is in ``target``."""
+    for i in range(len(s), -1, -1):
+        if i < len(s) and s[i] != " ":
+            continue  # not a word boundary
+        if s[:i] in target:
+            return i
+    return 0
+
+
+def _longest_suffix_in(s: str, target: str) -> int:
+    """Length of the longest word-aligned suffix of ``s`` that is in ``target``."""
+    for i in range(len(s), -1, -1):
+        start = len(s) - i
+        if start > 0 and s[start - 1] != " ":
+            continue  # suffix doesn't start at a word boundary
+        if s[-i:] in target:
+            return i
+    return 0
+
+
+def _split_cross_column_paragraphs(md: str, page) -> str:
+    """Re-split paragraphs that a backend glued across the two-column boundary.
+
+    Docling's layout model occasionally merges a left-column element (e.g. the
+    last cell of a side box) with the right column's opening sentence into a
+    single paragraph. Using the detected column split and pymupdf's per-column
+    raw text, a paragraph whose head lives in the left column and whose tail
+    lives in the right column is split at that boundary.
+
+    Degrades to ``md`` unchanged when no clear column split exists.
+    """
+    if not _has_pymupdf:
+        return md
+    split = _detect_column_split(_collect_blocks(page), page.rect.width)
+    if split is None:
+        return md
+    width, height = page.rect.width, page.rect.height
+    left_text = _reading_normalize(
+        page.get_text(clip=pymupdf.Rect(0, 0, split, height))
+    )
+    right_text = _reading_normalize(
+        page.get_text(clip=pymupdf.Rect(split, 0, width, height))
+    )
+
+    out: list[str] = []
+    for para in md.split("\n\n"):
+        stripped = para.strip()
+        words = stripped.split()
+        if len(words) < 8:
+            out.append(stripped)
+            continue
+        norm = _reading_normalize(stripped)
+        p = _longest_prefix_in(norm, left_text)
+        s = _longest_suffix_in(norm, right_text)
+        if not (p > 0 and s > 0 and p + s >= len(norm) - 1 and p < len(norm) - s):
+            out.append(stripped)
+            continue
+        cut = len(norm[:p].split())
+        if not (3 <= cut <= len(words) - 3):
+            out.append(stripped)
+            continue
+        out.append(" ".join(words[:cut]))
+        out.append(" ".join(words[cut:]))
+    return "\n\n".join(p for p in out if p)
 
 
 def _spacing_fixes(md: str) -> str:
@@ -628,61 +849,172 @@ def translate_text_google(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class PdfPageView(QLabel):
-    """Left panel — displays the rendered PDF page."""
+class PdfPageView(QGraphicsView):
+    """Left panel — displays the rendered PDF page.
+
+    In "select mode" the user can drag a rubber-band rectangle; the selection
+    is emitted in scene coordinates (full-resolution pixels of the rendered
+    page), which the caller converts back to PDF points.
+    """
+
+    # x0, y0, x1, y1 in scene (full-res pixmap) coordinates
+    region_selected = pyqtSignal(float, float, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumWidth(300)
-        self.setText("Apri un PDF per iniziare")
-        self.setFont(QFont("Segoe UI", 14))
-        self.setStyleSheet(
-            "QLabel { background: #2b2b2b; color: #888; border: none; }"
-        )
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setBackgroundBrush(QColor(43, 43, 43))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+
         self._full_pixmap: QPixmap | None = None
-        self._last_size = None
+        self._pix_item: QGraphicsPixmapItem | None = None
+        self._text_item: QGraphicsTextItem | None = None
+
+        self._select_mode = False
+        self._rubber_item: QGraphicsRectItem | None = None
+        self._rubber_origin = None
+        self._band_pen = QPen(QColor(74, 144, 217), 2, Qt.PenStyle.DashLine)
+        self._band_brush = QBrush(QColor(74, 144, 217, 70))
+
+        self._show_message_text("Apri un PDF per iniziare")
+
+    # ── scene management ──────────────────────────────────────────────
+
+    def _clear_scene(self):
+        self._scene.clear()
+        self._pix_item = None
+        self._text_item = None
+        self._rubber_item = None
+        self._rubber_origin = None
+
+    def _show_message_text(self, text: str):
+        self._clear_scene()
+        item = QGraphicsTextItem(text)
+        item.setDefaultTextColor(QColor(136, 136, 136))
+        item.setFont(QFont("Segoe UI", 14))
+        self._text_item = item
+        self._scene.addItem(item)
+        r = item.boundingRect()
+        item.setPos(-r.width() / 2, -r.height() / 2)
+        self._scene.setSceneRect(
+            -r.width() / 2 - 20, -r.height() / 2 - 20,
+            r.width() + 40, r.height() + 40,
+        )
 
     def show_page(self, pixmap: QPixmap | None):
         """Store the full-resolution pixmap and scale it to fit the view."""
         if pixmap is None:
             self._full_pixmap = None
-            self._last_size = None
-            self.setText("(pagina non disponibile)")
+            self._show_message_text("(pagina non disponibile)")
             return
         self._full_pixmap = pixmap
-        self._last_size = None
+        self._clear_scene()
+        self._pix_item = self._scene.addPixmap(pixmap)
+        self._scene.setSceneRect(QRectF(pixmap.rect()))
         self._fit_to_view()
 
     def show_message(self, text: str):
         """Show a plain status message instead of a page (e.g. while loading)."""
         self._full_pixmap = None
-        self._last_size = None
-        self.setText(text)
+        self._show_message_text(text)
+
+    # ── selection mode ───────────────────────────────────────────────────
+
+    def set_select_mode(self, enabled: bool):
+        """Enable/disable rubber-band region selection."""
+        self._select_mode = enabled
+        self._clear_rubber()
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        else:
+            self.unsetCursor()
+
+    def _clear_rubber(self):
+        if self._rubber_item is not None:
+            self._scene.removeItem(self._rubber_item)
+            self._rubber_item = None
+        self._rubber_origin = None
+
+    # ── sizing ──────────────────────────────────────────────────────────
 
     def _fit_to_view(self):
-        """Scale the full-resolution pixmap to fit the current label size."""
-        if self._full_pixmap is None:
-            return
-        view_size = self.size()
-        if view_size.width() < 10 or view_size.height() < 10:
-            return
-        scaled = self._full_pixmap.scaled(
-            view_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.setPixmap(scaled)
-        self._last_size = (view_size.width(), view_size.height())
+        """Scale the full-resolution pixmap to fit the current view size."""
+        if self._pix_item is not None:
+            self.fitInView(self._pix_item, Qt.AspectRatioMode.KeepAspectRatio)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._full_pixmap is None:
-            return
-        new_size = self.size()
-        if self._last_size == (new_size.width(), new_size.height()):
-            return
         self._fit_to_view()
+
+    # ── rubber band mouse handling ─────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if (
+            self._select_mode
+            and self._pix_item is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            try:
+                self._clear_rubber()
+                pos = self.mapToScene(event.position().toPoint())
+                self._rubber_origin = pos
+                self._rubber_item = QGraphicsRectItem(QRectF(pos, pos))
+                self._rubber_item.setPen(self._band_pen)
+                self._rubber_item.setBrush(self._band_brush)
+                self._scene.addItem(self._rubber_item)
+            except Exception:
+                # Never let an exception escape a virtual handler: in PyQt6
+                # that aborts the whole process.
+                self._clear_rubber()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._select_mode
+            and self._rubber_item is not None
+            and self._rubber_origin is not None
+        ):
+            try:
+                cur = self.mapToScene(event.position().toPoint())
+                self._rubber_item.setRect(
+                    QRectF(self._rubber_origin, cur).normalized()
+                )
+            except Exception:
+                self._clear_rubber()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            self._select_mode
+            and self._rubber_item is not None
+            and self._rubber_origin is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            try:
+                cur = self.mapToScene(event.position().toPoint())
+                rect = QRectF(self._rubber_origin, cur).normalized()
+                self._clear_rubber()
+                if rect.width() >= 4.0 and rect.height() >= 4.0:
+                    self.region_selected.emit(
+                        rect.left(), rect.top(), rect.right(), rect.bottom()
+                    )
+            except Exception:
+                self._clear_rubber()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class TextPanel(QTextEdit):
@@ -959,6 +1291,10 @@ class TranslatablePanel(QWidget):
                     self._translated_text, as_markdown=as_markdown
                 )
                 self._lbl_spinner.setText("")
+            elif _EXTRACTING_PLACEHOLDER in text:
+                # Docling still extracting: don't translate (or cache) the
+                # placeholder — wait for the real text to re-enter show_text.
+                self._lbl_spinner.setText("⏳ Attendo estrazione…")
             else:
                 self._start_translation(text)
         else:
@@ -994,6 +1330,8 @@ class TranslatablePanel(QWidget):
                 self._translated_text, as_markdown=self._render_md
             )
             self._lbl_spinner.setText("")
+        elif _EXTRACTING_PLACEHOLDER in self._original_text:
+            self._lbl_spinner.setText("⏳ Attendo estrazione…")
         else:
             self._start_translation(self._original_text)
 
@@ -1005,6 +1343,12 @@ class TranslatablePanel(QWidget):
         self.images_panel.show()
         self._rebuild_images_panel()
         self._lbl_spinner.setText("")
+
+    def show_images(self, images: list[str]):
+        """Set the current page's figures and activate the gallery tab."""
+        self._images = list(images or [])
+        self._rebuild_images_panel()
+        self._on_show_images()
 
     # ── Images gallery ─────────────────────────────────────────────────
 
@@ -1156,6 +1500,13 @@ class TranslatablePanel(QWidget):
         """Clear per-page translation cache."""
         self._page_translation_cache.clear()
 
+    def shutdown(self):
+        """Wait for any in-flight translation before the app closes."""
+        if self._thread is not None:
+            if self._thread.isRunning():
+                self._thread.wait(5000)
+            self._thread = None
+
 
 class TocPanel(QWidget):
     """Dockable multi-level table of contents navigator."""
@@ -1289,9 +1640,10 @@ class MainWindow(QMainWindow):
         self._mupdf_doc = None       # cached pymupdf Document (render engine)
         self._qtpdf_doc = None       # cached QPdfDocument (render engine)
         self._docling_converter = None   # cached Docling converter (reused)
-        self._docling_images_dir: Path | None = None  # dir for extracted figures
+        self._images_dir: Path | None = None  # dir for extracted figures
         self._docling_cache: dict[int, str] = {}  # page (0-based) -> markdown
         self._docling_image_uris: dict[int, list[str]] = {}  # page -> file:// URIs
+        self._mupdf_image_uris: dict[int, list[str]] = {}  # page -> auto-extracted
         self._current_images: list[str] = []  # figures for the current page
         self._docling_worker = None  # background Docling extractor (lazy)
         self._docling_generation: int = 0  # bumped on each PDF open
@@ -1325,16 +1677,24 @@ class MainWindow(QMainWindow):
         # Splitter
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left — scroll area wrapping the page view
+        # Left — mini toolbar + scroll area wrapping the page view
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.pdf_view = PdfPageView()
+        self.pdf_view.region_selected.connect(self._on_region_selected)
         self.scroll_area.setWidget(self.pdf_view)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+        left_layout.addWidget(self._build_page_toolbar())
+        left_layout.addWidget(self.scroll_area)
 
         # Right — text panel with translation tabs
         self.text_panel = TranslatablePanel()
 
-        self.splitter.addWidget(self.scroll_area)
+        self.splitter.addWidget(left_panel)
         self.splitter.addWidget(self.text_panel)
         self.splitter.setSizes([700, 700])
 
@@ -1530,6 +1890,22 @@ class MainWindow(QMainWindow):
         self.fix_combo.currentTextChanged.connect(self._on_fix_changed)
         bar.addWidget(self.fix_combo)
 
+    def _build_page_toolbar(self):
+        """Mini toolbar shown above the PDF page viewer (left panel)."""
+        bar = QToolBar("Pagina")
+        bar.setMovable(False)
+
+        # Region selection (extract the image under a mouse-drawn rectangle)
+        self.btn_select_region = QPushButton("🖱️ Seleziona zona")
+        self.btn_select_region.setCheckable(True)
+        self.btn_select_region.setToolTip(
+            "Trascina col mouse una zona della pagina\n"
+            "per estrarne l'immagine nella tab 🖼️ Immagini"
+        )
+        self.btn_select_region.clicked.connect(self._on_select_region_toggled)
+        bar.addWidget(self.btn_select_region)
+        return bar
+
     def _display_text(
         self, text: str, page_num: int = -1, images: list[str] | None = None
     ):
@@ -1579,12 +1955,16 @@ class MainWindow(QMainWindow):
         else:
             text = "(backend sconosciuto)"
 
-        # Track the figures extracted for this page (Docling only populates it).
-        self._current_images = self._docling_image_uris.get(page_num, [])
+        # Track the figures for this page: Docling populates its own cache;
+        # the other backends auto-extract embedded images via PyMuPDF.
+        if backend == "Docling 🧠":
+            self._current_images = self._docling_image_uris.get(page_num, [])
+        else:
+            self._current_images = self._get_mupdf_images(page_num)
 
         # Docling cache miss → extraction runs in background; show a hint.
         if text is None:
-            return "⏳ Estrazione in corso…", time.perf_counter() - t0
+            return _EXTRACTING_PLACEHOLDER, time.perf_counter() - t0
 
         # Apply the selected layout fix
         text = self._apply_fix(text, page_num)
@@ -1604,6 +1984,84 @@ class MainWindow(QMainWindow):
         except Exception as e:
             return f"(errore pymupdf4llm: {e})"
 
+    # ── image extraction (PyMuPDF) ──────────────────────────────────────
+
+    def _get_mupdf_images(self, page_num: int) -> list[str]:
+        """Auto-extract (cached) the embedded images of a page via PyMuPDF."""
+        if page_num in self._mupdf_image_uris:
+            return self._mupdf_image_uris[page_num]
+        uris = self._extract_embedded_images(page_num)
+        self._mupdf_image_uris[page_num] = uris
+        return uris
+
+    def _extract_embedded_images(self, page_num: int) -> list[str]:
+        """Extract the page's embedded raster images into the figures dir."""
+        doc = self._get_mupdf_doc()
+        if doc is None:
+            return []
+        images_dir = self._get_images_dir()
+        prefix = f"page_{page_num + 1:04d}_auto_"
+        for old in images_dir.glob(prefix + "*"):
+            old.unlink(missing_ok=True)
+
+        uris: list[str] = []
+        for data, ext in _page_embedded_images(doc, page_num):
+            path = images_dir / f"{prefix}{len(uris)}.{ext}"
+            try:
+                path.write_bytes(data)
+            except Exception:
+                continue
+            uris.append(path.resolve().as_uri())
+        return uris
+
+    def _extract_image_region(self, page_num: int, clip) -> str | None:
+        """Extract the image in a PDF-points rect and save it (file:// URI)."""
+        doc = self._get_mupdf_doc()
+        if doc is None or not _has_pymupdf:
+            return None
+        result = _region_image(
+            doc, page_num, clip, max(self._render_scale, 4.0)
+        )
+        if result is None:
+            return None
+        data, ext = result
+        images_dir = self._get_images_dir()
+        prefix = f"page_{page_num + 1:04d}_region_"
+        for old in images_dir.glob(prefix + "*"):
+            old.unlink(missing_ok=True)
+        path = images_dir / f"{prefix}0.{ext}"
+        try:
+            path.write_bytes(data)
+        except Exception:
+            return None
+        return path.resolve().as_uri()
+
+    def _on_region_selected(self, x0: float, y0: float, x1: float, y1: float):
+        """Extract the user-selected page region and show it in the gallery."""
+        self._set_select_mode(False)
+        scale = self._render_scale or 1.0
+        clip = (x0 / scale, y0 / scale, x1 / scale, y1 / scale)
+        uri = self._extract_image_region(self._current_page, clip)
+        if uri is None:
+            self.status_bar.showMessage(
+                "Nessuna immagine estraibile dalla zona selezionata"
+            )
+            return
+        if uri not in self._current_images:
+            self._current_images.append(uri)
+        self.text_panel.show_images(self._current_images)
+        name = Path(QUrl(uri).toLocalFile()).name
+        self.status_bar.showMessage(f"Immagine estratta dalla zona: {name}")
+
+    def _on_select_region_toggled(self, checked: bool):
+        """Enable/disable rubber-band selection on the left panel."""
+        self.pdf_view.set_select_mode(checked)
+
+    def _set_select_mode(self, enabled: bool):
+        """Update both the toggle button and the page view selection mode."""
+        self.btn_select_region.setChecked(enabled)
+        self.pdf_view.set_select_mode(enabled)
+
     def _get_docling_converter(self):
         """Build (once, lazily) the Docling converter with picture images enabled."""
         if self._docling_converter is None and _has_docling:
@@ -1619,18 +2077,23 @@ class MainWindow(QMainWindow):
             )
         return self._docling_converter
 
-    def _save_docling_images(self, result, page_num: int) -> list[str]:
-        """Extract Docling PictureItems for a page into a temp dir (file:// URIs)."""
-        if self._docling_images_dir is None:
+    def _get_images_dir(self) -> Path:
+        """Return (creating on first use) the per-document figures directory."""
+        if self._images_dir is None:
             base = QStandardPaths.writableLocation(
                 QStandardPaths.StandardLocation.AppDataLocation
             )
             if not base:
                 base = str(Path.home() / ".noesis-pdf-reader")
-            self._docling_images_dir = Path(base) / "images" / self._pdf_path.stem
-        self._docling_images_dir.mkdir(parents=True, exist_ok=True)
+            self._images_dir = Path(base) / "images" / self._pdf_path.stem
+        self._images_dir.mkdir(parents=True, exist_ok=True)
+        return self._images_dir
+
+    def _save_docling_images(self, result, page_num: int) -> list[str]:
+        """Extract Docling PictureItems for a page into a temp dir (file:// URIs)."""
+        images_dir = self._get_images_dir()
         prefix = f"page_{page_num + 1:04d}_img_"
-        for old in self._docling_images_dir.glob(prefix + "*.png"):
+        for old in images_dir.glob(prefix + "*.png"):
             old.unlink(missing_ok=True)
 
         uris: list[str] = []
@@ -1644,7 +2107,7 @@ class MainWindow(QMainWindow):
                 continue
             if img is None:
                 continue
-            path = self._docling_images_dir / f"{prefix}{i}.png"
+            path = images_dir / f"{prefix}{i}.png"
             img.convert("RGB").save(path)
             uris.append(path.resolve().as_uri())
             i += 1
@@ -1662,6 +2125,17 @@ class MainWindow(QMainWindow):
         for uri in uris:
             md = md.replace(placeholder, f"![figura]({uri})", 1)
         md = clean_text(md).strip() or "(nessun testo estraibile su questa pagina)"
+        # Fix: Docling occasionally glues a left-column element to the right
+        # column's opening sentence; re-split across the column boundary.
+        if _has_pymupdf:
+            try:
+                mupdf_doc = pymupdf.open(str(self._pdf_path))
+                try:
+                    md = _split_cross_column_paragraphs(md, mupdf_doc[page_num])
+                finally:
+                    mupdf_doc.close()
+            except Exception:
+                pass
         return md, uris
 
     def _extract_docling(self, page_num: int) -> str | None:
@@ -2074,9 +2548,10 @@ class MainWindow(QMainWindow):
 
             self._plumber_cache.clear()
             self._pdfoxide_doc = None
-            self._docling_images_dir = None
+            self._images_dir = None
             self._docling_cache.clear()
             self._docling_image_uris.clear()
+            self._mupdf_image_uris.clear()
             self._current_images = []
             self._docling_generation += 1
             if self._docling_worker is not None:
@@ -2119,6 +2594,7 @@ class MainWindow(QMainWindow):
             # destroying a still-running QThread.
             if self._docling_worker.wait(5000):
                 self._docling_worker = None
+        self.text_panel.shutdown()
         super().closeEvent(event)
 
 

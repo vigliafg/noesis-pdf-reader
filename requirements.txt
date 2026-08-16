@@ -5,11 +5,10 @@ PyQt6>=6.6
 pypdfium2>=4.30
 pymupdf>=1.24
 
-# Text extraction backends
+# Text extraction backends (fast — no Docling/torch)
 pdfplumber>=0.10
 pdfminer.six>=20231228
 pymupdf4llm>=0.0.9
-docling>=2.0
 pdf_oxide>=0.3.77
 
 # Markdown rendering
