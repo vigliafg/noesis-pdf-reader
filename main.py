@@ -20,6 +20,11 @@ import pdfplumber
 from pdfminer.high_level import extract_text as _pdfminer_extract
 import markdown as _md_lib
 
+# Engine adattativo dei fix di layout (puro, senza PyQt). Le voci del combo
+# `FIXES` continuano a usare la vecchia catena `_apply_fix`; l'engine è una
+# modalità a richiesta utente (voce "Engine adattativo").
+import layout_engine
+
 _MD_EXTENSIONS = ["tables", "fenced_code", "codehilite"]
 
 # Shown in place of the text while Docling extracts a page in background.
@@ -285,6 +290,25 @@ def _collect_blocks(page) -> list[dict]:
     return blocks
 
 
+def _strip_margin_blocks(blocks: list[dict], page_height: float) -> list[dict]:
+    """Drop blocks that lie entirely in the top/bottom page margins.
+
+    Running headers, footers and watermarks (e.g. a "Made with Xodo" banner)
+    are decorative. If left in, a full-ish-width header spanning the gap
+    between two columns acts as a bridge in ``_merged_column_intervals`` and
+    collapses the page to a single column, breaking the reading order. The
+    band is the top/bottom 7% of the page (capped at 70pt), which removes
+    page chrome but keeps real body text.
+    """
+    band = min(0.07 * page_height, 70.0)
+    if band <= 0:
+        return blocks
+    return [
+        b for b in blocks
+        if b["y1"] > band and b["y0"] < page_height - band
+    ]
+
+
 def _merged_column_intervals(blocks: list[dict], page_width: float) -> list[list[float]]:
     """Merge narrow blocks into per-column x-intervals, dropping margin labels.
 
@@ -435,6 +459,111 @@ def _table_to_md(page, table) -> str:
     return "\n".join(out)
 
 
+def _box_to_md(text: str) -> str:
+    """Render a box's text as a single-column markdown table (first line = header)."""
+    lines = []
+    for ln in text.splitlines():
+        ln = re.sub(r"[\x07\t]+", " ", ln)
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+    if not lines:
+        return ""
+    out = [f"| {lines[0]} |", "| --- |"]
+    out += [f"| {ln} |" for ln in lines[1:]]
+    return "\n".join(out)
+
+
+def _box_title(page, rect: tuple) -> tuple[str, tuple | None]:
+    """Text block directly above a box (same x-range) → (title, bbox or None)."""
+    x0, y0, x1, y1 = rect
+    for b in _collect_blocks(page):
+        if not (b["y1"] <= y0 and b["y1"] >= y0 - 30):
+            continue
+        if not (b["x0"] >= x0 - 40 and b["x1"] <= x1 + 40):
+            continue
+        t = " ".join(s["text"] for line in b["lines"] for s in line)
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            return t, (b["x0"], b["y0"], b["x1"], b["y1"])
+    return "", None
+
+
+def _rect_overlap_area(r1: tuple, r2: tuple) -> float:
+    """Intersection area of two (x0, y0, x1, y1) rects."""
+    ox = max(0.0, min(r1[2], r2[2]) - max(r1[0], r2[0]))
+    oy = max(0.0, min(r1[3], r2[3]) - max(r1[1], r2[1]))
+    return ox * oy
+
+
+def _dedup_boxes(boxes: list[dict]) -> list[dict]:
+    """Drop boxes whose area is mostly covered by a larger kept box.
+
+    Nested/overlapping rectangles (e.g. a chart drawn as several bordered
+    cells) would otherwise be emitted as duplicate tables.
+    """
+    ordered = sorted(
+        boxes,
+        key=lambda b: (b["rect"][2] - b["rect"][0]) * (b["rect"][3] - b["rect"][1]),
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for bx in ordered:
+        r = bx["rect"]
+        area = (r[2] - r[0]) * (r[3] - r[1])
+        if area <= 0:
+            continue
+        if any(
+            _rect_overlap_area(r, k["rect"]) / area >= 0.6
+            for k in kept
+        ):
+            continue
+        kept.append(bx)
+    return kept
+
+
+def _detect_boxes(page, page_width: float, table_regions: list[tuple]) -> list[dict]:
+    """Detect bordered boxes (sidebars) and render them as markdown tables.
+
+    A box is a closed rectangle from ``get_drawings()`` that contains text and
+    is not part of a data table. Returns ``[{rect, title, title_bbox, md}]``.
+    """
+    pw, ph = page.rect.width, page.rect.height
+    boxes: list[dict] = []
+    for d in page.get_drawings():
+        if d["type"] not in ("fs", "s", "f"):
+            continue
+        r = d["rect"]
+        w, h = r[2] - r[0], r[3] - r[1]
+        if w < 60 or h < 30:
+            continue
+        if w > 0.97 * pw or h > 0.97 * ph:
+            continue  # full-page frame
+        if w >= 0.9 * pw and (r[1] < 60 or r[3] > ph - 60):
+            continue  # running header/footer, not a content box
+        rect = tuple(r)
+        # Skip boxes that are (mostly) inside a data table — their content is
+        # rendered by the table path, not the box path.
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        if area > 0 and any(
+            _rect_overlap_area(rect, tr) / area >= 0.5
+            for tr in table_regions
+        ):
+            continue
+        text = page.get_text(clip=r).strip()
+        if not text:
+            continue
+        # Skip trivial boxes: a lone page number / short label is not a sidebar.
+        n_lines = len([ln for ln in text.splitlines() if ln.strip()])
+        if n_lines < 2 and len(text) < 30:
+            continue
+        title, tbbox = _box_title(page, rect)
+        boxes.append(
+            {"rect": rect, "title": title, "title_bbox": tbbox, "md": _box_to_md(text)}
+        )
+    return _dedup_boxes(boxes)
+
+
 def _column_aware_markdown(page, move_title: bool = False) -> str:
     """Reconstruct a page in correct reading order.
 
@@ -446,6 +575,7 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
     the other column. Every body paragraph is emitted exactly once.
     """
     page_width = page.rect.width
+    page_height = page.rect.height
 
     # Detect data tables (rendered as markdown) and their bboxes.
     table_regions: list[tuple] = []
@@ -466,6 +596,11 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
                     {"y0": bbox[1], "x0": bbox[0], "x1": bbox[2], "md": md}
                 )
 
+    # Detect bordered boxes (sidebars) and render them as tables too.
+    boxes = _detect_boxes(page, page_width, table_regions)
+    box_regions = [b["rect"] for b in boxes]
+    box_titles = {b["title"] for b in boxes if b["title"]}
+
     def _inside(b: dict, r: tuple) -> bool:
         return (
             b["x0"] >= r[0] - 2 and b["x1"] <= r[2] + 2
@@ -475,19 +610,33 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
     blocks = [b for b in _collect_blocks(page) if b["max_size"] >= 6.5]
 
     full_width: list[dict] = []  # spans the page → separator
-    body: list[dict] = []        # column paragraphs (outside tables)
+    body: list[dict] = []        # column paragraphs (outside tables/boxes)
     for b in blocks:
         if any(_inside(b, r) for r in table_regions):
             continue  # covered by the markdown table
+        if any(_inside(b, r) for r in box_regions):
+            continue  # covered by the box table
+        if box_titles:
+            t = " ".join(s["text"] for line in b["lines"] for s in line)
+            if re.sub(r"\s+", " ", t).strip() in box_titles:
+                continue  # box title rendered above the box table
         w = b["x1"] - b["x0"]
         if w >= 0.6 * page_width:
             full_width.append(b)
         elif w >= 25:
             body.append(b)
 
-    # Robust column boundaries, computed from body paragraphs only.
-    # Handles two-column prose as well as three/four-column indexes.
-    splits = _detect_column_splits(body, page_width)
+    # Robust column boundaries, computed from all non-table blocks (incl. box
+    # content): a column that is entirely a box must still count as a column,
+    # otherwise the layout collapses to single-column and the box is misordered.
+    split_blocks = [
+        b for b in blocks if not any(_inside(b, r) for r in table_regions)
+    ]
+    # Headers/footers/watermarks must not bridge the column gap (they would
+    # collapse the page to a single column).
+    splits = _detect_column_splits(
+        _strip_margin_blocks(split_blocks, page_height), page_width
+    )
 
     def _col_of(x: float) -> int:
         return sum(1 for s in splits if x > s)
@@ -500,7 +649,7 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
         body = [b for b in body if b not in titles]
         titles.sort(key=lambda b: b["max_size"])
 
-    # Full-width separators: full-width blocks + full-width tables only.
+    # Full-width separators: full-width blocks + full-width tables + boxes.
     separators: list[tuple[float, str]] = []
     for b in full_width:
         md = _block_to_md(b, as_column=False)
@@ -509,6 +658,10 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
     for ti in table_items:
         if (ti["x1"] - ti["x0"]) >= 0.6 * page_width:
             separators.append((ti["y0"], ti["md"]))
+    for bx in boxes:
+        if (bx["rect"][2] - bx["rect"][0]) >= 0.6 * page_width:
+            md = f"**{bx['title']}**\n\n{bx['md']}" if bx["title"] else bx["md"]
+            separators.append((bx["rect"][1], md))
     separators.sort(key=lambda s: s[0])
 
     # Column paragraphs, decomposed top-to-bottom: (y0, x0, md).
@@ -520,12 +673,19 @@ def _column_aware_markdown(page, move_title: bool = False) -> str:
             continue
         item = (b["y0"], b["x0"], md)
         col_items[_col_of((b["x0"] + b["x1"]) / 2)].append(item)
-    # Single-column tables belong to their column, at their y position.
+    # Single-column tables and in-column boxes belong to their column, at y.
     for ti in table_items:
         if (ti["x1"] - ti["x0"]) >= 0.6 * page_width:
             continue
         mid = (ti["x0"] + ti["x1"]) / 2
         item = (ti["y0"], ti["x0"], ti["md"])
+        col_items[_col_of(mid)].append(item)
+    for bx in boxes:
+        if (bx["rect"][2] - bx["rect"][0]) >= 0.6 * page_width:
+            continue
+        mid = (bx["rect"][0] + bx["rect"][2]) / 2
+        md = f"**{bx['title']}**\n\n{bx['md']}" if bx["title"] else bx["md"]
+        item = (bx["rect"][1], bx["rect"][0], md)
         col_items[_col_of(mid)].append(item)
     for items in col_items:
         items.sort(key=lambda it: (it[0], it[1]))
@@ -586,6 +746,8 @@ def _page_needs_column_reorder(page) -> bool:
         b for b in blocks
         if (b["x1"] - b["x0"]) < 0.6 * page_width and (b["x1"] - b["x0"]) >= 25
     ]
+    # Headers/footers/watermarks must not bridge the column gap.
+    columns = _strip_margin_blocks(columns, page.rect.height)
     splits = _detect_column_splits(columns, page_width)
     if not splits:
         return False
@@ -647,7 +809,10 @@ def _split_cross_column_paragraphs(md: str, page) -> str:
     """
     if not _has_pymupdf:
         return md
-    split = _detect_column_split(_collect_blocks(page), page.rect.width)
+    # Headers/footers/watermarks must not bridge the column gap (they would
+    # hide the real split and disable the re-split).
+    blocks = _strip_margin_blocks(_collect_blocks(page), page.rect.height)
+    split = _detect_column_split(blocks, page.rect.width)
     if split is None:
         return md
     width, height = page.rect.width, page.rect.height
@@ -1619,6 +1784,7 @@ class MainWindow(QMainWindow):
     FIXES = [
         "Auto",
         "Nessuno",
+        "Engine adattativo",
         "Riordino colonne",
         "Colonne + titolo in testa",
         "Spaziature",
@@ -1883,6 +2049,8 @@ class MainWindow(QMainWindow):
             "Correzioni generiche al layout estratto\n"
             "Auto: applica il riordino colonne solo se la pagina lo richiede\n"
             "Nessuno: output del backend così com'è\n"
+            "Engine adattativo: profilo→piano→pipeline (layout_engine.py), "
+            "decide da solo i fix per il layout della pagina\n"
             "Riordino colonne: riordina le pagine a due colonne\n"
             "Colonne + titolo in testa: sposta il titolo del capitolo in cima\n"
             "Spaziature: correzioni cosmetiche al markdown"
@@ -2365,11 +2533,33 @@ class MainWindow(QMainWindow):
             f"  │  {len(text)} caratteri{fix_part} ──\n\n"
         )
 
+    def _apply_engine(self, text: str, page_num: int) -> str:
+        """Apply the adaptive fix engine (layout_engine.py) to the page.
+
+        Profilo → Piano → Pipeline: misura il layout, decide i fix applicabili
+        in base al backend corrente e li applica in ordine. Fallisce in modo
+        silenzioso restituendo il testo invariato.
+        """
+        doc = self._get_mupdf_doc()
+        if doc is None:
+            return text
+        backend = self.backend_combo.currentText()
+        try:
+            profile = layout_engine.profile_page(doc[page_num])
+            plan = layout_engine.plan_fixes(profile, backend, mode="auto")
+            return layout_engine.apply_plan(
+                text, doc[page_num], profile, plan
+            ) or text
+        except Exception:
+            return text
+
     def _apply_fix(self, text: str, page_num: int) -> str:
         """Apply the selected layout fix to extracted text."""
         fix = self.fix_combo.currentText()
         if fix == "Nessuno":
             return text
+        if fix == "Engine adattativo":
+            return self._apply_engine(text, page_num)
         if fix == "Spaziature":
             return _spacing_fixes(text)
         doc = self._get_mupdf_doc()

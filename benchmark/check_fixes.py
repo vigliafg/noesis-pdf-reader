@@ -145,6 +145,9 @@ def _geometry_anchors(page) -> list[str]:
         if not any(_inside(b, r) for r in table_regions)
         and (b["x1"] - b["x0"]) < 0.6 * page.rect.width  # column-width only
     ]
+    # Headers/footers/watermarks are not content: keep them out of both the
+    # split detection and the anchor selection (same rule as the engine).
+    blocks = app._strip_margin_blocks(blocks, page.rect.height)
     splits = app._detect_column_splits(blocks, page.rect.width)
     if not splits:
         return []

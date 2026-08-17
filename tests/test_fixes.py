@@ -46,6 +46,8 @@ RIGHT = (320, 520)
 
 REAL_PDF = os.path.join(_ROOT, "harrison2025.pdf")
 REAL_CECIL_PDF = os.path.join(_ROOT, "cecil2024.pdf")
+REAL_ROSEN_PDF = os.path.join(_ROOT, "rosen2022.pdf")
+REAL_DAVID_PDF = os.path.join(_ROOT, "david2027.pdf")
 
 
 def _new_page(width=PAGE_W, height=PAGE_H):
@@ -225,6 +227,24 @@ class PageNeedsColumnReorderTests(unittest.TestCase):
         self.assertFalse(_page_needs_column_reorder(page))
         doc.close()
 
+    def test_watermark_header_does_not_bridge_columns(self):
+        # A decorative full-ish-width banner in the top margin that spans the
+        # gap between the two columns (e.g. "Made with Xodo") must not merge
+        # them into one column — otherwise the page stays single-column and the
+        # columns get interleaved.
+        doc, page = _new_page()
+        page.insert_textbox(
+            pymupdf.Rect(180, 5, 430, 20),
+            "Made with Xodo PDF Reader and Editor",
+            fontsize=14,
+        )
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "Left one.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 220, 250, 300), "Left two.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 120, 520, 200), "Right one.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 220, 520, 300), "Right two.", fontsize=10)
+        self.assertTrue(_page_needs_column_reorder(page))
+        doc.close()
+
 
 class BlockToMdTests(unittest.TestCase):
     @staticmethod
@@ -400,6 +420,31 @@ class ColumnAwareTests(unittest.TestCase):
         self.assertLess(md.index("Gamma entry two."), md.index("Delta entry one."))
         doc.close()
 
+    def test_sidebar_box_rendered_as_markdown_table(self):
+        # A bordered box (sidebar) must be rendered as a markdown table, not
+        # flattened into the body text with glued bullets. find_tables() does
+        # not detect a single bordered rectangle, so the box path (get_drawings)
+        # has to catch it.
+        doc, page = _new_page()
+        page.insert_textbox(pymupdf.Rect(50, 120, 250, 200), "Left text above.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(50, 500, 250, 580), "Left text below.", fontsize=10)
+        page.insert_textbox(pymupdf.Rect(320, 300, 520, 380), "Right text.", fontsize=10)
+        box = pymupdf.Rect(320, 90, 520, 220)
+        page.draw_rect(box, color=(0, 0, 0), width=1)
+        page.insert_textbox(pymupdf.Rect(325, 95, 515, 120), "Box item one", fontsize=9)
+        page.insert_textbox(pymupdf.Rect(325, 125, 515, 150), "Box item two", fontsize=9)
+        page.insert_textbox(pymupdf.Rect(325, 155, 515, 180), "Box item three", fontsize=9)
+
+        md = _column_aware_markdown(page, move_title=False)
+        self.assertIn("| Box item one |", md)
+        self.assertIn("| --- |", md)
+        self.assertIn("| Box item two |", md)
+        self.assertIn("| Box item three |", md)
+        # Box content must not be duplicated as plain body text.
+        self.assertEqual(md.count("Box item one"), 1)
+        self.assertEqual(md.count("Box item two"), 1)
+        doc.close()
+
 
 @unittest.skipUnless(os.path.exists(REAL_PDF), "harrison2025.pdf not present")
 class CrossColumnSplitTests(unittest.TestCase):
@@ -493,6 +538,55 @@ class CecilPdfRegressionTests(unittest.TestCase):
         md = _column_aware_markdown(self.doc[4381], move_title=False)
         self.assertLess(md.index("Dermatomyositis"), md.index("Diazepam"))
         self.assertIn("nordiazepam", md)
+
+
+@unittest.skipUnless(os.path.exists(REAL_ROSEN_PDF), "rosen2022.pdf not present")
+class RosenPdfRegressionTests(unittest.TestCase):
+    """Regression checks on Rosen (sidebar boxes)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = pymupdf.open(REAL_ROSEN_PDF)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.doc.close()
+
+    def test_page_59_sidebar_box_rendered_as_table(self):
+        # The "BOX 3.2" sidebar must come out as a markdown table (as
+        # pymupdf4llm renders it), not as glued plain-text bullets.
+        md = _column_aware_markdown(self.doc[58], move_title=False)
+        self.assertIn("BOX 3.2", md)
+        self.assertIn("Ill appearance or altered mental status", md)
+        self.assertIn("| --- |", md)
+        self.assertIn("Heart rate >100 beats/min", md)
+
+
+@unittest.skipUnless(os.path.exists(REAL_DAVID_PDF), "david2027.pdf not present")
+class DavidPdfRegressionTests(unittest.TestCase):
+    """Regression checks on David (Xodo watermark must not bridge columns)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = pymupdf.open(REAL_DAVID_PDF)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.doc.close()
+
+    def test_page_27_watermark_does_not_collapse_columns(self):
+        # The "Made with Xodo" banner in the top margin spans the column gap;
+        # it must not merge the two columns into one (which interleaved the
+        # left column into the right column's flow).
+        self.assertTrue(_page_needs_column_reorder(self.doc[26]))
+
+    def test_page_28_left_column_read_before_right_column(self):
+        # Left column's last paragraph precedes the right column's first
+        # heading — the exact order the watermark bridge was breaking.
+        md = _column_aware_markdown(self.doc[27], move_title=False)
+        self.assertLess(
+            md.index("Almost half of doctors"), md.index("Bat and ball problem")
+        )
 
 
 if __name__ == "__main__":

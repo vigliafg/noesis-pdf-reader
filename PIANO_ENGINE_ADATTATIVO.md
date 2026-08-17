@@ -4,6 +4,21 @@ Redatto il 2026-08-16. **Da implementare in una sessione successiva.** Completa 
 [studio](STUDIO_ENGINE_ADATTATIVO.md); qui ci sono solo le specifiche concrete del
 prototipo, i test e l'integrazione finale nel programma già funzionante.
 
+## Stato (2026-08-17) — implementato, attivazione a richiesta utente
+
+Implementato `layout_engine.py` + `tests/test_layout_engine.py` (21 test, suite
+64/64 verde). **Deviazione deliberata dal piano**: `_apply_fix` NON è stato
+riscritto per instradare tutto nell'engine — le voci del combo `FIXES`
+continuano a usare la vecchia catena. L'engine è una voce nuova del combo
+(`"Engine adattativo"`) attivata a richiesta dell'utente, che chiama
+`_apply_engine` (profilo → piano → pipeline). La migrazione completa (sostituire
+`_apply_fix`) resta da fare in una sessione successiva, quando l'engine sarà
+validato sui 3 libri + i 5 nuovi PDF.
+
+Nota: `has_index` è stato ridefinito rispetto al piano (pattern voce d'indice
+`", PAGINA"` ovunque nel blocco, non a fine riga) perché l'euristica originale
+non rilevava gli indici reali — vedi `VERIFICA_5_PDF.md`.
+
 ## Obiettivo
 
 Introdurre il motore "Profilo → Piano → Pipeline" descritto nello studio, senza

@@ -11,9 +11,23 @@ un posto dove agganciarsi (il fix `manual_regions` nel registro).
 ## Obiettivo
 
 Permettere all'utente di tracciare col mouse, sulla pagina renderizzata, **regioni
-tipizzate** (testo/tabella/immagine/ignora) e definirne la **sequenza di lettura**,
+tipizzate** (testo/tabella/box/immagine/ignora) e definirne la **sequenza di lettura**,
 salvare il tracciato per pagina, e far sì che l'estrazione della pagina usi il
 tracciato come override dell'auto.
+
+## Decisioni bloccate (brainstorm 2026-08-17)
+
+1. **Ordine = solo esplicito.** L'unico modo di assegnare la sequenza è lo
+   strumento "🔢 Sequenza" (numerazione per click); l'ordine di disegno non
+   assegna mai un posto. Le regioni nascono non numerate (`order = None`).
+2. **"▶ Applica manuale" bloccato** finché ci sono ≥2 regioni non numerate; con
+   una sola regione (o tutte "ignore") si applica comunque.
+3. **Override manuale = sempre.** Il tracciato vince su qualunque fix/modalità del
+   combo, con indicatore visivo di override attivo + "🧹 Pulisci" a un clic per
+   tornare all'estrazione auto.
+4. **Correzione vs ordine completo.** Solo `ignore`/`box`/`table`/`image` → overlay
+   sull'auto (le zone corrette, il resto auto). Almeno una regione `text` →
+   sostituzione del corpo con le regioni in ordine.
 
 ## Struttura dei file
 
@@ -31,13 +45,13 @@ Tutto resta in `main.py` (coerente col progetto single-file), tranne il modulo
 ```python
 from dataclasses import dataclass, field
 
-REGION_KINDS = ("text", "table", "image", "ignore")
+REGION_KINDS = ("text", "table", "box", "image", "ignore")
 
 @dataclass
 class Region:
-    kind: str                                  # "text"|"table"|"image"|"ignore"
+    kind: str                                  # "text"|"table"|"box"|"image"|"ignore"
     bbox: tuple[float, float, float, float]    # punti PDF (x0,y0,x1,y1)
-    order: int = 0                             # sequenza di lettura
+    order: int | None = None                   # sequenza di lettura (None = non numerata)
 
 @dataclass
 class ManualLayout:
@@ -63,12 +77,19 @@ quindi si riusa la logica `QStandardPaths`.
 ## Estrazione per regione (funzione pura, testabile)
 
 ```python
-def apply_manual_layout(page, layout: ManualLayout) -> str:
-    """Ricostruisce il markdown della pagina a partire dalle regioni, in ordine.
+def apply_manual_layout(md: str, page, layout: ManualLayout) -> str:
+    """Applica il tracciato manuale (correzione o ordine completo).
+
+    - correzione (solo ignore/box/table/image) → parte dall'output auto `md` e
+      sovrappone le correzioni (ignore esclude, box/table/image rendono col
+      percorso giusto).
+    - ordine completo (c'è almeno una regione text) → output = sole regioni
+      tracciate, in ordine di `order`.
 
     - text   → page.get_text(clip=bbox, sort=True) + de-sillabazione
     - table  → tabella find_tables() la cui bbox interseca la regione, via _table_to_md
                (fallback: get_textbox(clip))
+    - box    → _detect_boxes()/get_text(clip) → tabella a una colonna + titolo
     - image  → _extract_image_region già esistente → link markdown ![](file://…)
     - ignore → saltata
     Le regioni vengono concatenate in ordine di `order` (a parità, ordine di disegno).
@@ -91,7 +112,7 @@ class PdfPageView(QGraphicsView):
 
     def set_tool(self, tool: str | None):
         """None=normale; "select"=zona immagine (esistente); "text"|"table"|
-        "image"|"ignore"=disegna regione; "sequence"=clicca per riordinare."""
+        "box"|"image"|"ignore"=disegna regione; "sequence"=clicca per riordinare."""
 
     def show_regions(self, regions: list[Region]): ...   # ridisegna overlay
     def clear_regions(self): ...
@@ -100,9 +121,9 @@ class PdfPageView(QGraphicsView):
 Dettagli:
 
 - **Overlay**: ogni regione = `QGraphicsRectItem` (penna colore per tipo:
-  text=verde, table=arancio, image=viola, ignore=rosso) + `QGraphicsTextItem` col
+  text=verde, table=arancio, box=ciano, image=viola, ignore=rosso) + `QGraphicsTextItem` col
   numero d'ordine. Item tenuti in `self._region_items`.
-- **Disegno**: `set_tool("text"|"table"|"image"|"ignore")` riusa il flusso
+- **Disegno**: `set_tool("text"|"table"|"box"|"image"|"ignore")` riusa il flusso
   `mousePress/Move/Release` esistente; al release emette `region_added` invece di
   `region_selected`.
 - **Conversione coordinate**: come oggi in `_on_region_selected`, dividere per
@@ -110,7 +131,9 @@ Dettagli:
   PDF (o lo converte il chiamante — scegliere e tenere un solo punto di conversione).
 - **Sequenza**: in `set_tool("sequence")` il click su un `QGraphicsRectItem`
   (hit-test sugli item della scena) emette `region_clicked(indice)`; il chiamante
-  riassegna `order` in ordine di click.
+  riassegna `order` in ordine di click. È l'**unico** modo di assegnare l'ordine:
+  il disegno non assegna mai un posto nella sequenza (regioni che nascono non
+  numerate).
 - **Sicurezza**: tutti i gestori mouse restano dentro try/except (PyQt6: un'eccezione
   in un handler virtuale abortisce il processo — lezione già appresa).
 
@@ -124,10 +147,11 @@ Estendere `_build_page_toolbar` con un gruppo di strumenti **mutuamente esclusiv
 | 🖱️ Seleziona zona (esistente) | `select` | estrazione immagine al volo (invariato) |
 | 📄 Testo | `text` | disegna regione testo |
 | 📊 Tabella | `table` | disegna regione tabella |
+| 📦 Box | `box` | disegna regione box (sidebar) |
 | 🖼️ Immagine | `image` | disegna regione immagine |
 | 🚫 Ignora | `ignore` | disegna regione da ignorare |
-| 🔢 Sequenza | `sequence` | clicca regioni per riordinarle |
-| ▶ Applica manuale | — | ri-estrae la pagina col tracciato |
+| 🔢 Sequenza | `sequence` | **unico** modo di ordinare: clicca regioni in sequenza |
+| ▶ Applica manuale | — | ri-estrae la pagina col tracciato (disabilitato con ≥2 regioni non numerate) |
 | 💾 Salva | — | persiste il tracciato (auto-salva anche al cambio pagina) |
 | 🧹 Pulisci | — | elimina il tracciato della pagina |
 
@@ -150,23 +174,24 @@ In `_apply_fix` (MainWindow), PRIMA di ogni altro ramo:
 
 ```python
 override = load_layout(self._pdf_path.stem, page_num + 1)
-if override is not None and fix == "Auto":        # o sempre, vedi nota
+if override is not None:                          # override assoluto (sempre)
     return apply_manual_layout(doc[page_num], override) or text
 ```
 
-**Decisione da confermare in implementazione**: il manuale vale **solo in `Auto`**
-(scelta conservativa) oppure **sempre** (override assoluto). Consiglio: *sempre*,
-perché è esattamente ciò che l'utente vuole quando traccia a mano; ma partiamo da
-`solo Auto` per non cambiare il comportamento dei fix manuali esistenti, e lo
-rendiamo un'opzione se serve.
+**Decisione (bloccata)**: il manuale vale **sempre** — override assoluto su
+qualunque fix/modalità scelta dal combo. È l'azione più deliberata dell'utente e
+deve avere effetto immediato, senza dipendere da "essere in Auto". Due prerequisiti
+per la semplicità: (a) indicatore visivo di override attivo sulla pagina, (b)
+"🧹 Pulisci" a un clic per tornare all'estrazione auto.
 
 ## Persistenza e ciclo di vita
 
 - Caricamento del tracciato della pagina in `_set_page` (dopo `_display_page`).
 - Salvataggio su "💾 Salva" e automaticamente quando si cambia pagina / si chiude.
 - "🧹 Pulisci" cancella il file e torna all'estrazione auto.
-- Il cambio backend/fix **non** tocca il tracciato; il tracciato vince finché esiste
-  (secondo la decisione sopra).
+- Il cambio backend/fix **non** tocca il tracciato; il tracciato vince **sempre**
+  finché esiste (override assoluto), con indicatore visivo + "Pulisci" per tornare
+  all'auto.
 
 ## Retrocompatibilità
 
@@ -181,17 +206,18 @@ Unitari (pagine sintetiche pymupdf, come `test_fixes.py`):
 1. `apply_manual_layout`: 2 regioni testo + 1 ignore → output contiene i due testi
    nell'ordine giusto e **non** quello ignorato.
 2. `apply_manual_layout`: regione tabella → `| --- |` presente (usa `_add_table`).
-3. `apply_manual_layout`: regione immagine → link `![` presente.
-4. `save_layout`/`load_layout` round-trip su dir temporanea (`tmp_path`).
-5. `delete_layout` rimuove il file.
-6. Conversione scena→punti PDF: con `_render_scale=3`, una regione scena
+3. `apply_manual_layout`: regione box → `| --- |` + titolo presente (riquadro con bordo).
+4. `apply_manual_layout`: regione immagine → link `![` presente.
+5. `save_layout`/`load_layout` round-trip su dir temporanea (`tmp_path`).
+6. `delete_layout` rimuove il file.
+7. Conversione scena→punti PDF: con `_render_scale=3`, una regione scena
    (0,0,300,300) → bbox PDF (0,0,100,100).
 
 Integrazione (MainWindow, headless `QT_QPA_PLATFORM=offscreen`):
 
-7. Pagina con tracciato salvato → `_apply_fix(..., "Auto")` usa il manuale (verificato
-   con un testo "ignora" assente e ordine corretto).
-8. Pagina senza tracciato → `_apply_fix` si comporta come oggi (nessun override).
+8. Pagina con tracciato salvato → `_apply_fix` usa il manuale (verificato con un
+   testo "ignora" assente e ordine corretto).
+9. Pagina senza tracciato → `_apply_fix` si comporta come oggi (nessun override).
 
 Regressione: i 43 test esistenti restano verdi; il flusso "Seleziona zona" resta
 verde (test già presenti in `test_images.py`).
@@ -199,7 +225,7 @@ verde (test già presenti in `test_images.py`).
 ## Criteri di accettazione
 
 - `tests/` verde: 43 esistenti + i nuovi di `test_manual_layout.py`.
-- L'utente può: disegnare 4 tipi di regione, riordinarle, applicarle, salvarle,
+- L'utente può: disegnare 5 tipi di regione, riordinarle, applicarle, salvarle,
   cancellarle; la pagina si estrae secondo l'ordine dato.
 - "Seleziona zona" invariato; pagine senza tracciato invariate.
 - Il tracciato persiste tra le sessioni e tra le pagine.
@@ -210,6 +236,8 @@ verde (test già presenti in `test_images.py`).
   arrivano dopo, quando engine adattativo + tracciato manuale sono entrambi pronti.
 - Snapping delle regioni ai blocchi auto-rilevati.
 - Regioni poligonali/non rettangolari.
+- Regioni che continuano su più pagine (caso 8 della tassonomia: un *collegamento*
+  "continua a pagina dopo", non un rettangolo).
 
 ## Rischi
 
